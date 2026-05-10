@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+pgdata/
+caddy_data/
+.idea/
+.vscode/
+*.egg-info/
