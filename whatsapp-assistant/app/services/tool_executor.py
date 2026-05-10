@@ -7,10 +7,13 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import EventReference, GoogleAccount, User
+from app.models import EventReference, GoogleAccount, Message, User
+from app.services.disambiguation import DisambiguationService
+from app.services.event_resolver import EventResolver, ResolvedEvent, is_vague_title
 from app.services.google_auth import GoogleAuthService, build_authorization_url
 from app.services.google_calendar import (
     GoogleCalendarError,
@@ -18,6 +21,11 @@ from app.services.google_calendar import (
     GoogleCalendarService,
     GoogleCalendarUnauthorized,
 )
+from app.services.pending_action import (
+    clear_pending_action,
+    set_pending_action,
+)
+from app.services.whatsapp import WhatsAppClient
 from app.utils.timezone import (
     InvalidDateTimeError,
     format_date_range,
@@ -43,12 +51,16 @@ class ToolExecutionLog:
 
     replies: list[str] = field(default_factory=list)
     results: list[dict[str, Any]] = field(default_factory=list)
+    sent_directly: bool = False
 
     @property
     def combined_reply(self) -> str:
         cleaned = [reply for reply in self.replies if reply]
         if cleaned:
             return "\n".join(cleaned)
+        if self.sent_directly:
+            # An interactive prompt was already sent — no text reply needed.
+            return ""
         return "I couldn't process that. Please try again."
 
 
@@ -59,6 +71,8 @@ class ToolExecutor:
         self,
         google_auth_factory=None,
         calendar_service_factory=None,
+        whatsapp_client_factory=None,
+        disambiguation_service_factory=None,
     ) -> None:
         self._google_auth_factory = google_auth_factory or (
             lambda session: GoogleAuthService(session)
@@ -68,6 +82,11 @@ class ToolExecutor:
                 access_token=token, calendar_id=calendar_id
             )
         )
+        self._whatsapp_client_factory = whatsapp_client_factory or WhatsAppClient
+        self._disambiguation_service_factory = (
+            disambiguation_service_factory
+            or (lambda client: DisambiguationService(client))
+        )
 
     async def execute(
         self,
@@ -76,12 +95,15 @@ class ToolExecutor:
         user: User,
         db: AsyncSession,
         inbound_message_id: uuid.UUID | None = None,
+        preselected_event: ResolvedEvent | None = None,
     ) -> ToolResult:
         handler = {
             "reply": self.handle_reply,
             "ask_clarification": self.handle_ask_clarification,
             "calendar_create": self.handle_calendar_create,
             "calendar_query": self.handle_calendar_query,
+            "calendar_update": self.handle_calendar_update,
+            "calendar_cancel": self.handle_calendar_cancel,
         }.get(tool_name)
 
         if handler is None:
@@ -93,7 +115,11 @@ class ToolExecutor:
 
         try:
             return await handler(
-                arguments, user=user, db=db, inbound_message_id=inbound_message_id
+                arguments,
+                user=user,
+                db=db,
+                inbound_message_id=inbound_message_id,
+                preselected_event=preselected_event,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception(
@@ -130,6 +156,7 @@ class ToolExecutor:
         user: User,
         db: AsyncSession,
         inbound_message_id: uuid.UUID | None = None,
+        **_: Any,
     ) -> ToolResult:
         title = str(arguments.get("title") or "").strip()
         start = arguments.get("start")
@@ -197,6 +224,10 @@ class ToolExecutor:
                 "tool": "calendar_create",
                 "google_event_id": google_event_id,
                 "html_link": event.get("htmlLink"),
+                "title": title,
+                "start": start,
+                "end": end,
+                "calendar_id": account.calendar_id,
             },
         )
 
@@ -268,6 +299,367 @@ class ToolExecutor:
             data={"tool": "calendar_query", "count": len(events)},
         )
 
+    async def handle_calendar_update(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        inbound_message_id: uuid.UUID | None = None,
+        preselected_event: ResolvedEvent | None = None,
+        **_: Any,
+    ) -> ToolResult:
+        new_title = arguments.get("new_title")
+        new_start = arguments.get("new_start")
+        new_end = arguments.get("new_end")
+        new_description = arguments.get("new_description")
+
+        if not any(
+            isinstance(value, str) and value
+            for value in (new_title, new_start, new_end, new_description)
+        ):
+            return ToolResult(
+                success=False,
+                message="What should I change about it?",
+                data={"tool": "calendar_update", "reason": "no_changes"},
+            )
+
+        for value in (new_start, new_end):
+            if isinstance(value, str) and value:
+                try:
+                    parse_iso_datetime(value)
+                except InvalidDateTimeError:
+                    return ToolResult(
+                        success=False,
+                        message="That date didn't look right — when should I move it to?",
+                        data={
+                            "tool": "calendar_update",
+                            "reason": "invalid_datetime",
+                        },
+                    )
+
+        token, account = await self._get_token_and_account(user, db)
+        if token is None or account is None:
+            return self._unauthorized_result("calendar_update", user)
+
+        if preselected_event is not None:
+            return await self._apply_calendar_update(
+                event=preselected_event,
+                arguments=arguments,
+                user=user,
+                db=db,
+                account=account,
+                token=token,
+            )
+
+        resolution = await self._resolve_event(
+            arguments=arguments, user=user, db=db, account=account, token=token
+        )
+        if isinstance(resolution, ToolResult):
+            return resolution
+        if resolution is None:
+            return _not_found_result("calendar_update", arguments)
+        if isinstance(resolution, list):
+            return await self._send_disambiguation(
+                action_type="calendar_update",
+                action_label="update",
+                arguments=arguments,
+                user=user,
+                db=db,
+                events=resolution,
+            )
+
+        return await self._apply_calendar_update(
+            event=resolution,
+            arguments=arguments,
+            user=user,
+            db=db,
+            account=account,
+            token=token,
+        )
+
+    async def handle_calendar_cancel(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        inbound_message_id: uuid.UUID | None = None,
+        preselected_event: ResolvedEvent | None = None,
+        **_: Any,
+    ) -> ToolResult:
+        token, account = await self._get_token_and_account(user, db)
+        if token is None or account is None:
+            return self._unauthorized_result("calendar_cancel", user)
+
+        if preselected_event is not None:
+            return await self._apply_calendar_cancel(
+                event=preselected_event,
+                user=user,
+                db=db,
+                account=account,
+                token=token,
+            )
+
+        resolution = await self._resolve_event(
+            arguments=arguments, user=user, db=db, account=account, token=token
+        )
+        if isinstance(resolution, ToolResult):
+            return resolution
+        if resolution is None:
+            return _not_found_result("calendar_cancel", arguments)
+        if isinstance(resolution, list):
+            return await self._send_disambiguation(
+                action_type="calendar_cancel",
+                action_label="cancel",
+                arguments=arguments,
+                user=user,
+                db=db,
+                events=resolution,
+            )
+
+        return await self._apply_calendar_cancel(
+            event=resolution,
+            user=user,
+            db=db,
+            account=account,
+            token=token,
+        )
+
+    # --- internal helpers --------------------------------------------------
+
+    async def _resolve_event(
+        self,
+        *,
+        arguments: dict[str, Any],
+        user: User,
+        db: AsyncSession,
+        account: GoogleAccount,
+        token: str,
+    ) -> ResolvedEvent | list[ResolvedEvent] | ToolResult | None:
+        search_title = arguments.get("search_title")
+        search_date = arguments.get("search_date")
+
+        # Context-aware resolution for vague references like "it" or "that".
+        if is_vague_title(search_title):
+            recent_messages = await _load_recent_messages(user.id, db)
+            event_id = await EventResolver.resolve_from_context(
+                recent_messages, search_title
+            )
+            if event_id:
+                fetched = await self._call_with_refresh(
+                    user=user,
+                    db=db,
+                    account=account,
+                    token=token,
+                    action=lambda access_token: self._calendar_service_factory(
+                        access_token, account.calendar_id
+                    ).get_event(event_id),
+                )
+                if isinstance(fetched, ToolResult):
+                    return fetched
+                resolved = _event_to_resolved(fetched, account.calendar_id)
+                if resolved is not None:
+                    return resolved
+                # Fall through to title-based search if the context event
+                # has gone away.
+
+        async def search(access_token: str):
+            calendar = self._calendar_service_factory(
+                access_token, account.calendar_id
+            )
+
+            async def list_events(time_min, time_max, query):
+                return await calendar.list_events(
+                    time_min=time_min, time_max=time_max, query=query
+                )
+
+            resolver = EventResolver(list_events, account.calendar_id)
+            return await resolver.resolve(
+                search_title=search_title if isinstance(search_title, str) else None,
+                search_date=search_date if isinstance(search_date, str) else None,
+                user_id=user.id,
+                db=db,
+            )
+
+        return await self._call_with_refresh(
+            user=user, db=db, account=account, token=token, action=search
+        )
+
+    async def _apply_calendar_update(
+        self,
+        *,
+        event: ResolvedEvent,
+        arguments: dict[str, Any],
+        user: User,
+        db: AsyncSession,
+        account: GoogleAccount,
+        token: str,
+    ) -> ToolResult:
+        timezone = user.timezone or get_settings().default_timezone
+        new_title = arguments.get("new_title")
+        new_start = arguments.get("new_start")
+        new_end = arguments.get("new_end")
+        new_description = arguments.get("new_description")
+
+        updates: dict[str, Any] = {}
+        if isinstance(new_title, str) and new_title:
+            updates["summary"] = new_title
+        if isinstance(new_start, str) and new_start:
+            updates["start"] = {"dateTime": new_start, "timeZone": timezone}
+        if isinstance(new_end, str) and new_end:
+            updates["end"] = {"dateTime": new_end, "timeZone": timezone}
+        if isinstance(new_description, str):
+            updates["description"] = new_description
+
+        if not updates:
+            return ToolResult(
+                success=False,
+                message="What should I change about it?",
+                data={"tool": "calendar_update", "reason": "no_changes"},
+            )
+
+        result = await self._call_with_refresh(
+            user=user,
+            db=db,
+            account=account,
+            token=token,
+            action=lambda access_token: self._calendar_service_factory(
+                access_token, account.calendar_id
+            ).update_event(event.event_id, updates),
+        )
+        if isinstance(result, ToolResult):
+            return result
+
+        final_title = (
+            new_title if isinstance(new_title, str) and new_title else event.title
+        )
+        final_start = (
+            new_start if isinstance(new_start, str) and new_start else event.start
+        )
+        final_end = (
+            new_end if isinstance(new_end, str) and new_end else event.end
+        )
+
+        parts: list[str] = []
+        if isinstance(new_title, str) and new_title:
+            parts.append(f"title '{new_title}'")
+        if (isinstance(new_start, str) and new_start) or (
+            isinstance(new_end, str) and new_end
+        ):
+            try:
+                parts.append(format_event_time(final_start, final_end, timezone))
+            except InvalidDateTimeError:
+                pass
+        if isinstance(new_description, str):
+            parts.append("description updated")
+        changes_summary = ", ".join(parts) or "details updated"
+
+        return ToolResult(
+            success=True,
+            message=f"Updated: {final_title} -> {changes_summary}",
+            data={
+                "tool": "calendar_update",
+                "google_event_id": event.event_id,
+                "calendar_id": event.calendar_id,
+                "title": final_title,
+                "start": final_start,
+                "end": final_end,
+            },
+        )
+
+    async def _apply_calendar_cancel(
+        self,
+        *,
+        event: ResolvedEvent,
+        user: User,
+        db: AsyncSession,
+        account: GoogleAccount,
+        token: str,
+    ) -> ToolResult:
+        timezone = user.timezone or get_settings().default_timezone
+
+        result = await self._call_with_refresh(
+            user=user,
+            db=db,
+            account=account,
+            token=token,
+            action=lambda access_token: self._calendar_service_factory(
+                access_token, account.calendar_id
+            ).delete_event(event.event_id),
+        )
+        if isinstance(result, ToolResult):
+            return result
+
+        await _delete_event_reference(user.id, event.event_id, db)
+
+        try:
+            formatted = format_event_time(event.start, event.end, timezone)
+        except InvalidDateTimeError:
+            formatted = ""
+        suffix = f" - {formatted}" if formatted else ""
+        return ToolResult(
+            success=True,
+            message=f"Cancelled: {event.title}{suffix}",
+            data={
+                "tool": "calendar_cancel",
+                "google_event_id": event.event_id,
+                "calendar_id": event.calendar_id,
+                "title": event.title,
+            },
+        )
+
+    async def _send_disambiguation(
+        self,
+        *,
+        action_type: str,
+        action_label: str,
+        arguments: dict[str, Any],
+        user: User,
+        db: AsyncSession,
+        events: list[ResolvedEvent],
+    ) -> ToolResult:
+        timezone = user.timezone or get_settings().default_timezone
+        client = self._whatsapp_client_factory()
+        service = self._disambiguation_service_factory(client)
+        try:
+            disambiguation_id = await service.send_event_choices(
+                wa_id=user.wa_id,
+                events=events,
+                action=action_label,
+                timezone_name=timezone,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send disambiguation prompt for user=%s", user.id
+            )
+            return ToolResult(
+                success=False,
+                message="I found a few matching events. Try again with more detail.",
+                data={"tool": action_type, "reason": "disambiguation_send_failed"},
+            )
+
+        set_pending_action(
+            user,
+            disambiguation_id=disambiguation_id,
+            action_type=action_type,
+            arguments=arguments,
+            options=events,
+        )
+        await db.flush()
+
+        return ToolResult(
+            success=True,
+            message="",
+            data={
+                "tool": action_type,
+                "reason": "disambiguation",
+                "disambiguation_id": disambiguation_id,
+                "options_count": len(events),
+                "sent_directly": True,
+            },
+        )
+
     async def _get_token_and_account(
         self, user: User, db: AsyncSession
     ) -> tuple[str | None, GoogleAccount | None]:
@@ -275,10 +667,6 @@ class ToolExecutor:
         token = await auth.get_valid_token(user.id)
         if token is None:
             return None, None
-        # Re-read the account so we know the calendar_id; get_valid_token may
-        # have refreshed the row already.
-        from sqlalchemy import select
-
         result = await db.execute(
             select(GoogleAccount).where(GoogleAccount.user_id == user.id)
         )
@@ -317,7 +705,6 @@ class ToolExecutor:
                 data={"reason": "calendar_error"},
             )
 
-        # Retry path after 401
         auth = self._google_auth_factory(db)
         try:
             new_token = await auth.refresh_token(account)
@@ -357,6 +744,37 @@ class ToolExecutor:
         )
 
 
+async def execute_pending_action(
+    *,
+    pending: dict[str, Any],
+    selected_event: ResolvedEvent,
+    user: User,
+    db: AsyncSession,
+    inbound_message_id: uuid.UUID | None = None,
+    tool_executor: ToolExecutor,
+) -> ToolResult:
+    """Replay a previously parked tool call against the user-selected event."""
+    action_type = pending.get("type")
+    arguments = pending.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    if action_type not in {"calendar_update", "calendar_cancel"}:
+        return ToolResult(
+            success=False,
+            message="That selection has expired.",
+            data={"reason": "unknown_pending_type"},
+        )
+    clear_pending_action(user)
+    return await tool_executor.execute(
+        action_type,
+        arguments,
+        user=user,
+        db=db,
+        inbound_message_id=inbound_message_id,
+        preselected_event=selected_event,
+    )
+
+
 def _format_event_line(event: dict[str, Any], timezone: str) -> str:
     summary = str(event.get("summary") or "(no title)")
     start = (event.get("start") or {}).get("dateTime") or (
@@ -372,3 +790,64 @@ def _format_event_line(event: dict[str, Any], timezone: str) -> str:
     except InvalidDateTimeError:
         return f"- {summary}"
     return f"- {time_part} - {summary}"
+
+
+def _event_to_resolved(
+    event: dict[str, Any], calendar_id: str
+) -> ResolvedEvent | None:
+    event_id = event.get("id")
+    if not isinstance(event_id, str) or not event_id:
+        return None
+    summary = str(event.get("summary") or "(no title)")
+    start_obj = event.get("start") or {}
+    end_obj = event.get("end") or {}
+    start = start_obj.get("dateTime") or start_obj.get("date")
+    end = end_obj.get("dateTime") or end_obj.get("date")
+    if not start or not end:
+        return None
+    return ResolvedEvent(
+        event_id=event_id,
+        title=summary,
+        start=str(start),
+        end=str(end),
+        calendar_id=calendar_id,
+    )
+
+
+def _not_found_result(tool: str, arguments: dict[str, Any]) -> ToolResult:
+    title = arguments.get("search_title")
+    if isinstance(title, str) and title.strip():
+        message = f"I couldn't find an event matching '{title.strip()}'."
+    else:
+        message = "I couldn't find that event."
+    return ToolResult(
+        success=False,
+        message=message,
+        data={"tool": tool, "reason": "not_found"},
+    )
+
+
+async def _load_recent_messages(
+    user_id: uuid.UUID, db: AsyncSession, limit: int = 10
+) -> list[Message]:
+    result = await db.execute(
+        select(Message)
+        .where(Message.user_id == user_id)
+        .order_by(desc(Message.created_at))
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def _delete_event_reference(
+    user_id: uuid.UUID, google_event_id: str, db: AsyncSession
+) -> None:
+    result = await db.execute(
+        select(EventReference).where(
+            EventReference.user_id == user_id,
+            EventReference.google_event_id == google_event_id,
+        )
+    )
+    for row in result.scalars().all():
+        await db.delete(row)
+    await db.flush()

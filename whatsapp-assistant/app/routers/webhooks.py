@@ -19,7 +19,7 @@ router = APIRouter(prefix="/webhooks")
 
 # Set of message types we process end-to-end. Other types are acknowledged
 # but not echoed.
-_SUPPORTED_MESSAGE_TYPES = {"text"}
+_SUPPORTED_MESSAGE_TYPES = {"text", "interactive"}
 
 
 @router.get("/whatsapp")
@@ -123,6 +123,26 @@ def _parse_inbound_messages(payload: dict[str, Any]) -> list[InboundMessage]:
                     )
                     continue
 
+                if msg_type == "interactive":
+                    parsed = _parse_interactive(message)
+                    if parsed is None:
+                        logger.info(
+                            "Acknowledging unsupported interactive payload id=%s",
+                            wa_message_id,
+                        )
+                        continue
+                    interactive_id, reply_text = parsed
+                    results.append(
+                        InboundMessage(
+                            wa_id=wa_id,
+                            wa_message_id=wa_message_id,
+                            text=reply_text,
+                            phone_number_id=phone_number_id,
+                            interactive_id=interactive_id,
+                        )
+                    )
+                    continue
+
                 text_body = ((message.get("text") or {}).get("body")) or ""
                 results.append(
                     InboundMessage(
@@ -133,3 +153,19 @@ def _parse_inbound_messages(payload: dict[str, Any]) -> list[InboundMessage]:
                     )
                 )
     return results
+
+
+def _parse_interactive(message: dict[str, Any]) -> tuple[str, str] | None:
+    interactive = message.get("interactive") or {}
+    itype = interactive.get("type")
+    if itype == "button_reply":
+        reply = interactive.get("button_reply") or {}
+    elif itype == "list_reply":
+        reply = interactive.get("list_reply") or {}
+    else:
+        return None
+    reply_id = reply.get("id")
+    if not isinstance(reply_id, str) or not reply_id:
+        return None
+    title = reply.get("title")
+    return reply_id, title if isinstance(title, str) else ""

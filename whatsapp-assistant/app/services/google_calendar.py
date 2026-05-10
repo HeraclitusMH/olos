@@ -113,6 +113,14 @@ class GoogleCalendarService:
         self._raise_for_status(response)
         return list(response.json().get("items") or [])
 
+    async def get_event(self, event_id: str) -> dict[str, Any]:
+        async with self._http_client_factory() as client:
+            response = await client.get(
+                self._events_url(event_id), headers=self._headers
+            )
+        self._raise_for_status(response)
+        return response.json()
+
     async def update_event(
         self, event_id: str, updates: dict[str, Any]
     ) -> dict[str, Any]:

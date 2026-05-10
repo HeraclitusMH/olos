@@ -2,7 +2,7 @@
 
 ## What this is
 
-WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (pgvector pinned, extension not yet enabled) + Caddy. Receives WhatsApp messages, plans tool calls via an OpenAI planner, executes a subset (`reply`, `ask_clarification`, `calendar_create`, `calendar_query`).
+WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (pgvector pinned, extension not yet enabled) + Caddy. Receives WhatsApp messages, plans tool calls via an OpenAI planner, executes calendar and reply tools.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Settings: `app/config.py:get_settings()` — never read `os.environ` in app code
 - Async DB engine/session/base: `app/database.py`
 - Routers: `app/routers/{webhooks,oauth}.py`
-- Services: `app/services/{whatsapp,message_processor,planner,context,cost_tracker,llm_tools,google_auth,google_calendar,tool_executor}.py`
+- Services: `app/services/{whatsapp,message_processor,planner,context,cost_tracker,llm_tools,google_auth,google_calendar,tool_executor,event_resolver,disambiguation,pending_action}.py`
 - Utils: `app/utils/{encryption,oauth_state,signature,timezone,generate_key}.py`
 - ORM models in `app/models/`, all re-exported from `app/models/__init__.py` so Alembic autogenerate sees them
 - Migrations: `alembic/versions/0001_initial_schema.py`, `0002_daily_api_usage.py`
@@ -23,7 +23,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Routes use `Depends(get_db)`; background work uses `AsyncSessionLocal`.
 - ORM relationships are `lazy="raise"`; eager-load with `selectinload` / `joinedload`.
 - All PKs are UUID with `server_default=gen_random_uuid()`. All timestamps `TIMESTAMPTZ`.
-- No `ON DELETE CASCADE`; preserve audit history. `Memory.deleted_at` is the soft-delete marker.
+- No `ON DELETE CASCADE`; preserve audit history. `Memory.deleted_at` is the soft-delete marker. `EventReference` rows are deleted on calendar cancel (no audit needed there).
 - DDL Alembic can't model (DESC/GIN indexes, triggers) goes through `op.execute(...)`.
 - Tokens never stored in plaintext or logged. Use `TokenEncryption` (`app/utils/encryption.py`). OAuth `state` uses Fernet with the same `ENCRYPTION_KEY` and a 10-minute TTL — do not replace with plain HMAC / unsigned JWT.
 - `ENCRYPTION_KEY` must be a Fernet key (`python -m app.utils.generate_key`).
@@ -37,13 +37,21 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - `pytest-asyncio` runs in `asyncio_mode = auto` — do not decorate tests with `@pytest.mark.asyncio`.
 - New secret settings must be added to both `.env.example` and `app/config.py:Settings`. `.env` is git-ignored.
 - Caddy terminates TLS; `api` container is not exposed on the host.
+- JSONB columns (`preferences_json`, etc.) require full reassignment to trigger SQLAlchemy dirty tracking — never mutate in place.
+- WhatsApp interactive messages: max 3 buttons (use list for 4+), button titles max 20 chars.
+
+## Disambiguation & Pending Actions
+
+- When `calendar_update`/`calendar_cancel` match >1 event, `ToolExecutor._send_disambiguation` sends WhatsApp buttons/list and parks the original arguments + candidate events in `user.preferences_json["pending_action"]` (5-min TTL).
+- `InboundMessage.interactive_id` is set for button/list replies. `message_processor._process_interactive_reply` validates the pending action (id match + expiry), extracts the selected `ResolvedEvent`, calls `execute_pending_action`, then clears state.
+- Option ids use format `disambig:<id>:<index>`. Decode with `disambiguation.parse_option_id`.
+- `EventResolver.resolve_from_context` only fires for vague titles ("it", "that", etc.) — checks `execution_result_json` of recent messages for `google_event_id`. `calendar_create` now stores `title/start/end/calendar_id` in its result data to enable this.
 
 ## Current State
 
-- 159 unit tests pass with `python -m pytest -q`.
-- Inbound text: deduped by `wa_message_id`, planner tool calls stored in `Message.tool_calls_json`, executed in sequence via `ToolExecutor`, results stored in `Message.execution_result_json` on both inbound and outbound rows.
-- Implemented planner tools: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`. `calendar_update`, `calendar_cancel`, and all `memory_*` tools fall through to `Tool {name} not yet implemented.`
+- 200 unit tests pass with `python -m pytest -q`.
+- Implemented planner tools: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`. All `memory_*` tools fall through to `Tool {name} not yet implemented.`
+- Interactive webhook replies (button_reply, list_reply) are parsed and routed through the disambiguation resume flow.
 - Google OAuth flow wired end-to-end (`/authorize` → consent → `/callback` → encrypted token storage).
 - `pgvector==0.2.5` pinned but `vector` extension not yet enabled — the first migration adding an embedding column must run `CREATE EXTENSION IF NOT EXISTS vector`.
-- Non-text inbound messages are silently acknowledged. Status webhooks are dropped.
 - The checked-in `.venv` launcher points at a missing Python path; run tests with system Python after installing `requirements.txt`.

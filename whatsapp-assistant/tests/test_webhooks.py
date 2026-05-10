@@ -302,3 +302,76 @@ def test_parse_extracts_text_message_fields() -> None:
     assert inbound.wa_message_id == "wamid.X"
     assert inbound.text == "hi there"
     assert inbound.phone_number_id == "1234567890"
+    assert inbound.interactive_id is None
+
+
+def _interactive_payload(
+    *,
+    interactive_type: str,
+    reply_id: str,
+    reply_title: str = "Pick me",
+    wa_id: str = "34600111222",
+    wa_message_id: str = "wamid.IR",
+) -> dict[str, Any]:
+    reply_key = "button_reply" if interactive_type == "button_reply" else "list_reply"
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "ENTRY_ID",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {"phone_number_id": "1234567890"},
+                            "messages": [
+                                {
+                                    "from": wa_id,
+                                    "id": wa_message_id,
+                                    "timestamp": "1700000000",
+                                    "type": "interactive",
+                                    "interactive": {
+                                        "type": interactive_type,
+                                        reply_key: {
+                                            "id": reply_id,
+                                            "title": reply_title,
+                                        },
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_parse_extracts_button_reply_interactive_id() -> None:
+    payload = _interactive_payload(
+        interactive_type="button_reply",
+        reply_id="disambig:abc:1",
+        reply_title="Project meeting",
+    )
+    [inbound] = _parse_inbound_messages(payload)
+    assert inbound.interactive_id == "disambig:abc:1"
+    assert inbound.text == "Project meeting"
+
+
+def test_parse_extracts_list_reply_interactive_id() -> None:
+    payload = _interactive_payload(
+        interactive_type="list_reply",
+        reply_id="disambig:abc:3",
+        reply_title="Dentist",
+    )
+    [inbound] = _parse_inbound_messages(payload)
+    assert inbound.interactive_id == "disambig:abc:3"
+    assert inbound.text == "Dentist"
+
+
+def test_parse_skips_unknown_interactive_type() -> None:
+    payload = _interactive_payload(
+        interactive_type="nfm_reply", reply_id="x", reply_title="y"
+    )
+    assert _parse_inbound_messages(payload) == []
