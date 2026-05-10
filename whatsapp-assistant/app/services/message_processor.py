@@ -4,44 +4,22 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import AsyncSessionLocal
 from app.models import Message, User
-from app.services.google_auth import GoogleAuthService, build_authorization_url
+from app.services.context import build_conversation_context
+from app.services.cost_tracker import CostTracker
+from app.services.planner import Planner
+from app.services.tool_executor import ToolExecutionLog, ToolExecutor, ToolResult
 from app.services.whatsapp import WhatsAppAPIError, WhatsAppClient
 
 logger = logging.getLogger(__name__)
-
-# Heuristic keywords that hint the user wants calendar/scheduling functionality.
-# A real intent classifier replaces this in a later prompt; for now we only need
-# to know when to prompt for Google authorization.
-_CALENDAR_KEYWORDS: tuple[str, ...] = (
-    "calendar",
-    "schedule",
-    "meeting",
-    "event",
-    "appointment",
-    "agenda",
-    "remind",
-    "book",
-)
-
-
-def _is_calendar_intent(text: str) -> bool:
-    lowered = text.lower()
-    return any(keyword in lowered for keyword in _CALENDAR_KEYWORDS)
-
-
-def _build_authorization_prompt(wa_id: str) -> str:
-    auth_url = build_authorization_url(wa_id)
-    return (
-        "To use calendar features, please link your Google account:\n"
-        f"{auth_url}"
-    )
 
 
 @dataclass(frozen=True)
@@ -78,14 +56,21 @@ async def process_inbound_message(
     inbound: InboundMessage,
     *,
     whatsapp_client: WhatsAppClient | None = None,
+    planner: Planner | None = None,
+    cost_tracker: CostTracker | None = None,
+    tool_executor: ToolExecutor | None = None,
 ) -> None:
     """Process one inbound text message.
 
     Steps: find/create user, dedupe by wa_message_id, store inbound message,
-    echo back via WhatsApp Cloud API, store outbound message, mark inbound
-    processed. All DB work runs in a single async session/transaction.
+    ask the LLM planner for tool calls, execute each tool call via the
+    ``ToolExecutor``, store outbound message, and mark inbound processed.
+    All DB work runs in a single async session/transaction.
     """
     client = whatsapp_client or WhatsAppClient()
+    planner = planner or Planner()
+    cost_tracker = cost_tracker or CostTracker()
+    tool_executor = tool_executor or ToolExecutor()
 
     try:
         async with AsyncSessionLocal() as session:
@@ -97,6 +82,9 @@ async def process_inbound_message(
                 return
 
             user = await _get_or_create_user(session, inbound.wa_id)
+            conversation_history = await build_conversation_context(
+                user.id, session, limit=20
+            )
 
             inbound_msg = Message(
                 user_id=user.id,
@@ -108,7 +96,29 @@ async def process_inbound_message(
             session.add(inbound_msg)
             await session.flush()
 
-            reply_text = await _build_reply(session, user, inbound)
+            execution = ToolExecutionLog()
+
+            if not await cost_tracker.check_limit(session):
+                execution.replies.append("Daily limit reached. Try again tomorrow!")
+                tool_calls: list[dict[str, Any]] = []
+            else:
+                await cost_tracker.increment(session)
+                tool_calls = await planner.plan(
+                    inbound.text,
+                    conversation_history,
+                    user.timezone or get_settings().default_timezone,
+                )
+                inbound_msg.tool_calls_json = {"tool_calls": tool_calls}
+                execution = await _execute_tool_calls(
+                    tool_calls,
+                    user=user,
+                    session=session,
+                    inbound_message_id=inbound_msg.id,
+                    tool_executor=tool_executor,
+                )
+
+            reply_text = execution.combined_reply
+
             send_error: str | None = None
             api_response: dict | None = None
             try:
@@ -130,9 +140,13 @@ async def process_inbound_message(
                 processed=True,
                 error=send_error,
             )
+            if execution.results:
+                outbound_msg.execution_result_json = {"results": execution.results}
             session.add(outbound_msg)
 
             inbound_msg.processed = True
+            if execution.results:
+                inbound_msg.execution_result_json = {"results": execution.results}
 
             await session.commit()
             logger.info(
@@ -148,19 +162,37 @@ async def process_inbound_message(
         )
 
 
-async def _build_reply(
-    session: AsyncSession, user: User, inbound: InboundMessage
-) -> str:
-    """Decide what to say back to the user.
-
-    Calendar-intent messages from unauthorized users get a one-shot Google
-    OAuth prompt; everything else falls through to the temporary echo.
-    """
-    if _is_calendar_intent(inbound.text):
-        auth_service = GoogleAuthService(session)
-        if not await auth_service.is_authorized(user.id):
-            return _build_authorization_prompt(inbound.wa_id)
-    return f"Echo: {inbound.text}"
+async def _execute_tool_calls(
+    tool_calls: list[dict[str, Any]],
+    *,
+    user: User,
+    session: AsyncSession,
+    inbound_message_id: Any,
+    tool_executor: ToolExecutor,
+) -> ToolExecutionLog:
+    log = ToolExecutionLog()
+    for tool_call in tool_calls:
+        name = tool_call.get("name")
+        arguments = tool_call.get("arguments") or {}
+        if not isinstance(name, str):
+            continue
+        result: ToolResult = await tool_executor.execute(
+            name,
+            arguments,
+            user=user,
+            db=session,
+            inbound_message_id=inbound_message_id,
+        )
+        if result.message:
+            log.replies.append(result.message)
+        log.results.append(
+            {
+                "tool": name,
+                "success": result.success,
+                "data": result.data,
+            }
+        )
+    return log
 
 
 def _extract_outbound_message_id(api_response: dict | None) -> str | None:

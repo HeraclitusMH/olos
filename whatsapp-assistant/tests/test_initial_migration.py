@@ -16,6 +16,12 @@ MIGRATION_PATH = (
     / "versions"
     / "0001_initial_schema.py"
 )
+MIGRATION_0002_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "0002_daily_api_usage.py"
+)
 
 
 def _parse_migration() -> ast.Module:
@@ -71,3 +77,11 @@ def test_migration_installs_search_vector_trigger() -> None:
     assert "memories_search_vector_update" in body
     assert "trg_memories_search_vector" in body
     assert "BEFORE INSERT OR UPDATE ON memories" in body
+
+
+def test_second_migration_creates_daily_api_usage() -> None:
+    body = MIGRATION_0002_PATH.read_text(encoding="utf-8")
+    assert 'down_revision = "0001"' in body
+    assert '"daily_api_usage"' in body
+    assert '"usage_date"' in body
+    assert '"request_count"' in body

@@ -1,56 +1,73 @@
 # CLAUDE.md
 
-## What this is
+## Project Overview
 
-WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (with pgvector) + Caddy reverse proxy, orchestrated via Docker Compose.
+WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (with pgvector pinned for future embeddings) + Caddy reverse proxy, orchestrated via Docker Compose. It receives WhatsApp messages, stores them, uses an OpenAI planner to choose assistant tool calls, and currently implements only conversational replies/clarifications while calendar and memory execution remain pending.
 
-## Architecture
+## Architecture & Key Decisions
 
-- `app/main.py` — FastAPI app, `lifespan` startup hook, `GET /health`. Includes `webhooks` and `oauth` routers.
-- `app/config.py` — `Settings` (pydantic-settings) + `get_settings()` (`@lru_cache`). All env reads go through here.
-- `app/database.py` — async engine, `AsyncSessionLocal`, `get_db()` FastAPI dependency, `Base = DeclarativeBase`.
-- `app/routers/webhooks.py` — `GET/POST /webhooks/whatsapp`. POST verifies `X-Hub-Signature-256`, fires `asyncio.create_task(process_inbound_message(...))` per text message. Always returns 200.
-- `app/routers/oauth.py` — `GET /oauth/google/authorize?wa_id=…` returns Google consent URL; `GET /oauth/google/callback` validates state, exchanges code, stores encrypted tokens.
-- `app/services/whatsapp.py` — `WhatsAppClient` (text + interactive button + interactive list senders) on Graph API v19.0 via `httpx.AsyncClient`. Raises `WhatsAppAPIError` on non-2xx.
-- `app/services/message_processor.py` — `process_inbound_message(InboundMessage)`: dedupes, upserts `User`, stores messages, builds reply via `_build_reply()`, stores outbound. Calendar-keyword messages from unauthorized users receive a Google auth URL instead of echo.
-- `app/services/google_auth.py` — `GoogleAuthService` (session-scoped): `get_valid_token`, `refresh_token`, `revoke_token`, `is_authorized`. `build_authorization_url(wa_id)` builds the Google consent URL with an encrypted state.
-- `app/utils/encryption.py` — `TokenEncryption(key)`: Fernet wrap; raises `TokenEncryptionError` on bad key or corrupted ciphertext (never logs token values).
-- `app/utils/oauth_state.py` — `OAuthStateCodec(key, ttl_seconds=600)`: Fernet-encrypts `{"wa_id": …}` as the OAuth `state` param; decode validates HMAC + TTL (CSRF + replay protection).
-- `app/utils/generate_key.py` — run with `python -m app.utils.generate_key` to print a fresh Fernet key for `.env`.
-- `app/utils/signature.py` — `validate_webhook_signature(payload, header, secret)` (HMAC-SHA256, constant-time compare).
-- `app/models/` — `User`, `Message`, `GoogleAccount`, `EventReference`, `Memory`, re-exported from `app/models/__init__.py`.
-- `alembic/versions/0001_initial_schema.py` — baseline: 5 tables, GIN indexes, `trg_memories_search_vector` trigger.
-- `tests/conftest.py` — generates a real Fernet key as `ENCRYPTION_KEY` at session start (not a placeholder string); exposes async `client` fixture via `httpx.ASGITransport`.
+- Async-only Python 3.12 service. No sync DB calls or sync HTTP in app code.
+- `DATABASE_URL` must use `postgresql+asyncpg://`.
+- Read config through `app/config.py:get_settings()`, never `os.environ` directly in app code.
+- Routes use `Depends(get_db)` for DB sessions. Background message processing uses `AsyncSessionLocal`.
+- ORM models must be re-exported from `app/models/__init__.py` so Alembic autogenerate sees them.
+- ORM relationships use `lazy="raise"`; eager-load explicitly with `selectinload` or `joinedload`.
+- Use FastAPI `lifespan` for startup/shutdown; do not add `@app.on_event`.
+- DDL that Alembic cannot model cleanly, such as DESC indexes, GIN indexes, and triggers, goes through `op.execute(...)`.
+- Tests must not require Docker or a live DB. Use `ASGITransport` for HTTP and fake/overridden sessions where needed. Migration tests inspect files via `ast.parse` instead of importing migration modules.
+- `pytest-asyncio` runs in `asyncio_mode = auto`; do not decorate tests with `@pytest.mark.asyncio`.
+- Tokens are never stored in plaintext and never logged. Use `TokenEncryption` from `app/utils/encryption.py`.
+- OpenAI planner calls must use `model="gpt-4o-mini"` and `tool_choice="required"`.
+- The planner system prompt injects current datetime freshly per call using `zoneinfo.ZoneInfo`, not `pytz`.
+- The LLM must always return tool calls. Plain assistant text is handled as an invalid planner response and converted to a short `reply` fallback.
+- Daily OpenAI API usage is counted by request count, not token cost.
 
-## Rules & Patterns
+## Where To Find Things
 
-- **Async only**: no sync DB calls, no sync HTTP. `DATABASE_URL` must use `postgresql+asyncpg://`.
-- Type hints on every function; PEP 8 strict; Python 3.12 syntax (`X | Y`, `list[T]`, `from datetime import UTC`) is fine.
-- Read config via `get_settings()`, never `os.environ` directly in app code.
-- Inject DB sessions with `Depends(get_db)`; never instantiate `AsyncSessionLocal` inline in routes.
-- New ORM models must be imported from `app/models/__init__.py` so Alembic autogenerate sees them.
-- ORM relationships use `lazy="raise"` — eager-load explicitly with `selectinload`/`joinedload`.
-- Use FastAPI `lifespan` context manager for startup/shutdown — `@app.on_event` is forbidden.
-- DDL that Alembic can't model cleanly (DESC composite indexes, GIN, triggers) goes through `op.execute(...)`.
-- Tests must not require Docker or a live DB. Use `ASGITransport` for HTTP; override `get_db` via `app.dependency_overrides` to inject fake sessions. Don't import migration files — inspect via `ast.parse`.
-- `pytest-asyncio` runs in `asyncio_mode = auto` — do not decorate tests with `@pytest.mark.asyncio`.
-- Tokens are **never** stored in plaintext, **never** logged at any level. Always use `TokenEncryption` from `app/utils/encryption.py`.
+- FastAPI app and health endpoint -> `app/main.py`
+- Runtime settings -> `app/config.py`
+- Async DB engine/session/base -> `app/database.py`
+- WhatsApp webhook routes -> `app/routers/webhooks.py`
+- Google OAuth routes -> `app/routers/oauth.py`
+- WhatsApp Graph API client -> `app/services/whatsapp.py`
+- Inbound message orchestration -> `app/services/message_processor.py`
+- OpenAI tool schema and system prompt -> `app/services/llm_tools.py`
+- OpenAI planner service -> `app/services/planner.py`
+- Conversation history builder -> `app/services/context.py`
+- Daily OpenAI request counter -> `app/services/cost_tracker.py`
+- Google token lifecycle -> `app/services/google_auth.py`
+- Fernet token encryption -> `app/utils/encryption.py`
+- OAuth state codec -> `app/utils/oauth_state.py`
+- Webhook signature validation -> `app/utils/signature.py`
+- ORM models -> `app/models/`
+- Initial schema migration -> `alembic/versions/0001_initial_schema.py`
+- Daily API counter migration -> `alembic/versions/0002_daily_api_usage.py`
+- Test configuration -> `tests/conftest.py`
 
-## Decisions & Constraints
+## Current State & Known Issues
 
-- `pgvector==0.2.5` is pinned but the `vector` extension is **not yet enabled**. The first migration that adds an embedding column must run `CREATE EXTENSION IF NOT EXISTS vector`.
-- All PKs are `UUID` with `server_default=gen_random_uuid()`. All timestamps are `TIMESTAMPTZ`.
-- No `ON DELETE CASCADE` anywhere — preserve the audit trail. `Memory.deleted_at` is the soft-delete marker.
-- `ENCRYPTION_KEY` must be a Fernet key (urlsafe-base64 of 32 bytes). Generate with `app/utils/generate_key.py`. A plain string will fail at `TokenEncryption` init.
-- OAuth state uses Fernet (same `ENCRYPTION_KEY`) with a 10-minute TTL — do not switch to a plain HMAC or unsigned JWT; the TTL prevents replay.
-- `GoogleAuthService.get_valid_token` refreshes proactively when `token_expires_at - now < 5 min`; on 4xx from Google or any decrypt failure it sets `status='revoked'` so the user is re-prompted.
-- Caddy terminates TLS; the `api` container is **not** exposed on the host.
-- `.env` is git-ignored; `.env.example` is the source of truth. Adding a secret → update both `.env.example` and `app/config.py:Settings`.
-
-## Current State
-
-- 129 unit tests passing (`pytest -q`). No CI configured.
-- Google OAuth flow is wired end-to-end: `/authorize` → Google consent → `/callback` → encrypted token storage. Calendar-keyword messages prompt unauthorized users with the auth URL; all other messages still echo.
-- `GoogleAuthService` is implemented but the calendar action handlers (reading/writing events) are not yet built.
+- 132 unit tests pass with `python -m pytest -q`.
+- WhatsApp text messages are deduplicated by `wa_message_id`, stored inbound, processed, and followed by an outbound DB row.
+- `Message.tool_calls_json` logs the full planner tool-call list as `{"tool_calls": [...]}`.
+- `reply` and `ask_clarification` are the only executed planner tools.
+- `calendar_*` and `memory_*` tools currently respond with `Tool {name} not yet implemented.`
+- Conversation context loads the latest non-null user messages, maps inbound to `user` and outbound to `assistant`, and sends them oldest-first.
+- Daily OpenAI call limits use `daily_api_usage.usage_date` as the primary key and `request_count`; exceeded limit response is `Daily limit reached. Try again tomorrow!`
+- Google OAuth flow is wired end-to-end: `/authorize` to Google consent to `/callback` to encrypted token storage.
+- `GoogleAuthService` is implemented, but actual calendar read/write handlers are not built.
+- Memory storage/retrieval/update/delete handlers are not built.
 - Non-text inbound messages are silently acknowledged. Status webhooks are dropped.
-- Schema baseline (`0001_initial_schema`) is the only revision; no embedding column / pgvector activation yet.
+- `pgvector==0.2.5` is pinned but the `vector` extension is not yet enabled. The first migration adding an embedding column must run `CREATE EXTENSION IF NOT EXISTS vector`.
+- All PKs are UUID with `server_default=gen_random_uuid()`. All timestamps are `TIMESTAMPTZ`.
+- No `ON DELETE CASCADE`; preserve audit history. `Memory.deleted_at` is the soft-delete marker.
+- `ENCRYPTION_KEY` must be a Fernet key. Generate with `python -m app.utils.generate_key`.
+- OAuth state uses Fernet with the same `ENCRYPTION_KEY` and a 10-minute TTL; do not replace it with plain HMAC or unsigned JWT.
+- `GoogleAuthService.get_valid_token` refreshes when `token_expires_at - now < 5 min`; on Google 4xx or decrypt failure it marks the account `status='revoked'`.
+- Caddy terminates TLS; the `api` container is not exposed on the host.
+- `.env` is git-ignored. `.env.example` is the source of truth. New secret settings must be added to both `.env.example` and `app/config.py:Settings`.
+- Local note: the checked-in `.venv` launcher currently points at a missing Python path; tests were run with the system Python after installing `requirements.txt`.
+
+## Session Log
+
+- [2026-05-10] Implemented OpenAI planner integration: added tool schemas, fresh datetime system prompt, `Planner.plan()`, conversation context builder, daily API usage counter, and wired `message_processor.py` to log tool calls and execute only `reply`/`ask_clarification`.
+- [2026-05-10] Added `DailyApiUsage` model and `0002_daily_api_usage` Alembic migration. Updated tests for planner tools, context mapping, response extraction, message processor tool responses, and the new model/migration.

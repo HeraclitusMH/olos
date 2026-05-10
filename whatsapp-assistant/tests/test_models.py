@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     ARRAY,
     Boolean,
+    Date,
     DateTime,
     Integer,
     LargeBinary,
@@ -18,7 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from app.database import Base
-from app.models import EventReference, GoogleAccount, Memory, Message, User
+from app.models import DailyApiUsage, EventReference, GoogleAccount, Memory, Message, User
 
 
 # ---------- metadata registration ----------
@@ -31,6 +32,7 @@ def test_all_models_registered_in_metadata() -> None:
         "google_accounts",
         "event_references",
         "memories",
+        "daily_api_usage",
     }
 
 
@@ -355,3 +357,33 @@ def test_memory_repr_includes_source_and_deleted_flag() -> None:
     assert "Memory" in out
     assert "whatsapp" in out
     assert "deleted=False" in out
+
+
+# ---------- DailyApiUsage ----------
+
+
+def test_daily_api_usage_tablename() -> None:
+    assert DailyApiUsage.__tablename__ == "daily_api_usage"
+
+
+def test_daily_api_usage_date_is_primary_key() -> None:
+    col = DailyApiUsage.__table__.c.usage_date
+    assert isinstance(col.type, Date)
+    assert col.primary_key is True
+
+
+def test_daily_api_usage_request_count_default() -> None:
+    col = DailyApiUsage.__table__.c.request_count
+    assert isinstance(col.type, Integer)
+    assert col.nullable is False
+    assert col.server_default.arg.text == "0"
+
+
+def test_daily_api_usage_timestamps() -> None:
+    created_at = DailyApiUsage.__table__.c.created_at
+    updated_at = DailyApiUsage.__table__.c.updated_at
+
+    assert isinstance(created_at.type, DateTime)
+    assert created_at.type.timezone is True
+    assert created_at.server_default.arg.text == "now()"
+    assert updated_at.onupdate is not None
