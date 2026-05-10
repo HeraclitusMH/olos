@@ -9,8 +9,11 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (w
 - `app/main.py` — FastAPI app, `lifespan` startup hook, `GET /health`.
 - `app/config.py` — `Settings` (pydantic-settings) + `get_settings()` (`@lru_cache`). All env reads go through here.
 - `app/database.py` — async engine, `AsyncSessionLocal`, `get_db()` FastAPI dependency, `Base = DeclarativeBase`.
-- `app/routers/webhooks.py` — `GET/POST /webhooks/whatsapp` (Meta verification + inbound messages, currently stubs).
-- `app/models/` — `User`, `Message`, `GoogleAccount`, `EventReference`, `Memory`, all re-exported from `app/models/__init__.py`. `app/services/`, `app/utils/` are still empty.
+- `app/routers/webhooks.py` — `GET/POST /webhooks/whatsapp`. GET echoes Meta's `hub.challenge` as plain text on token match (403 otherwise). POST verifies `X-Hub-Signature-256`, parses the envelope, and fires `asyncio.create_task(process_inbound_message(...))` per text message. Always returns 200 (even on bad signature/JSON) so Meta does not retry.
+- `app/services/whatsapp.py` — `WhatsAppClient` (text + interactive button + interactive list senders) on Graph API v19.0 via `httpx.AsyncClient`. Raises `WhatsAppAPIError` on non-2xx.
+- `app/services/message_processor.py` — `process_inbound_message(InboundMessage)`: opens its own `AsyncSessionLocal`, dedupes on `wa_message_id`, upserts `User`, stores inbound `Message`, sends `"Echo: {text}"` via `WhatsAppClient`, stores outbound `Message` (with `error` field on send failure), marks inbound `processed=True`, single commit.
+- `app/utils/signature.py` — `validate_webhook_signature(payload, header, secret)` (HMAC-SHA256, constant-time compare, expects `sha256=<hex>` prefix).
+- `app/models/` — `User`, `Message`, `GoogleAccount`, `EventReference`, `Memory`, all re-exported from `app/models/__init__.py`.
 - `alembic/env.py` — async migration runner; pulls URL from `get_settings()`, imports `app.models` to register metadata.
 - `alembic/versions/0001_initial_schema.py` — baseline: 5 tables, GIN indexes on `memories.search_vector`/`memories.tags`, composite indexes on `messages`, and `trg_memories_search_vector` (BEFORE INSERT/UPDATE) which auto-populates `search_vector` from `content || tags` via `to_tsvector('english', ...)`.
 - `tests/conftest.py` — sets test env vars **before** any app import; exposes async `client` fixture via `httpx.ASGITransport`.
@@ -42,6 +45,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (w
 
 ## Current State
 
-- 64 unit tests passing (`pytest -q`). No CI configured.
-- WhatsApp webhook endpoints return placeholder JSON — no signature verification, no message handling, no DB writes yet.
+- 80 unit tests passing (`pytest -q`). No CI configured.
+- WhatsApp webhook is wired end-to-end: signature verification → parse → background task → DB writes → echo. Echo replies are still hardcoded `"Echo: {text}"`; no LLM/intent routing yet.
+- Non-text inbound messages (image/voice/etc.) are silently acknowledged but not processed. Status webhooks are dropped.
 - Schema baseline (`0001_initial_schema`) is the only revision; no embedding column / pgvector activation yet.
