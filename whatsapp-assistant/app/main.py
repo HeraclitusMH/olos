@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI
 
-from app.routers import webhooks
+from app.routers import oauth, webhooks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="WhatsApp Personal Assistant", lifespan=lifespan)
 
 app.include_router(webhooks.router)
+app.include_router(oauth.router)
 
 
 @app.get("/health")

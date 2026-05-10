@@ -11,9 +11,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models import Message, User
+from app.services.google_auth import GoogleAuthService, build_authorization_url
 from app.services.whatsapp import WhatsAppAPIError, WhatsAppClient
 
 logger = logging.getLogger(__name__)
+
+# Heuristic keywords that hint the user wants calendar/scheduling functionality.
+# A real intent classifier replaces this in a later prompt; for now we only need
+# to know when to prompt for Google authorization.
+_CALENDAR_KEYWORDS: tuple[str, ...] = (
+    "calendar",
+    "schedule",
+    "meeting",
+    "event",
+    "appointment",
+    "agenda",
+    "remind",
+    "book",
+)
+
+
+def _is_calendar_intent(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in _CALENDAR_KEYWORDS)
+
+
+def _build_authorization_prompt(wa_id: str) -> str:
+    auth_url = build_authorization_url(wa_id)
+    return (
+        "To use calendar features, please link your Google account:\n"
+        f"{auth_url}"
+    )
 
 
 @dataclass(frozen=True)
@@ -80,16 +108,16 @@ async def process_inbound_message(
             session.add(inbound_msg)
             await session.flush()
 
-            echo_text = f"Echo: {inbound.text}"
+            reply_text = await _build_reply(session, user, inbound)
             send_error: str | None = None
             api_response: dict | None = None
             try:
                 api_response = await client.send_text_message(
-                    to=inbound.wa_id, text=echo_text
+                    to=inbound.wa_id, text=reply_text
                 )
             except (WhatsAppAPIError, httpx.HTTPError) as exc:
                 logger.exception(
-                    "Failed to send echo to wa_id=%s: %s", inbound.wa_id, exc
+                    "Failed to send reply to wa_id=%s: %s", inbound.wa_id, exc
                 )
                 send_error = str(exc)
 
@@ -98,7 +126,7 @@ async def process_inbound_message(
                 user_id=user.id,
                 wa_message_id=outbound_wa_id,
                 direction="outbound",
-                content=echo_text,
+                content=reply_text,
                 processed=True,
                 error=send_error,
             )
@@ -118,6 +146,21 @@ async def process_inbound_message(
             inbound.wa_message_id,
             exc_info=True,
         )
+
+
+async def _build_reply(
+    session: AsyncSession, user: User, inbound: InboundMessage
+) -> str:
+    """Decide what to say back to the user.
+
+    Calendar-intent messages from unauthorized users get a one-shot Google
+    OAuth prompt; everything else falls through to the temporary echo.
+    """
+    if _is_calendar_intent(inbound.text):
+        auth_service = GoogleAuthService(session)
+        if not await auth_service.is_authorized(user.id):
+            return _build_authorization_prompt(inbound.wa_id)
+    return f"Echo: {inbound.text}"
 
 
 def _extract_outbound_message_id(api_response: dict | None) -> str | None:

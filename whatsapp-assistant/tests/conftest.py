@@ -2,6 +2,11 @@ import os
 from collections.abc import AsyncGenerator
 
 import pytest
+from cryptography.fernet import Fernet
+
+# A deterministic-per-run Fernet key keeps encryption-aware tests honest while
+# avoiding a hardcoded secret leaking into the repo.
+_TEST_FERNET_KEY = Fernet.generate_key().decode("utf-8")
 
 # Populate required env vars before any app module is imported so that
 # Settings() validation succeeds without a real .env file present.
@@ -18,7 +23,7 @@ _TEST_ENV: dict[str, str] = {
     "GOOGLE_CLIENT_ID": "google-client-id-test",
     "GOOGLE_CLIENT_SECRET": "google-client-secret-test",
     "GOOGLE_REDIRECT_URI": "https://example.com/oauth/google/callback",
-    "ENCRYPTION_KEY": "fernet-key-test",
+    "ENCRYPTION_KEY": _TEST_FERNET_KEY,
 }
 
 for key, value in _TEST_ENV.items():
