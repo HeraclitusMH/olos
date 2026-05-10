@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,7 @@ from app.models import Message, User
 from app.services.context import build_conversation_context
 from app.services.cost_tracker import CostTracker
 from app.services.disambiguation import parse_option_id
+from app.services.memory import MemoryService
 from app.services.pending_action import (
     clear_pending_action,
     deserialize_event,
@@ -26,9 +28,11 @@ from app.services.tool_executor import (
     ToolExecutionLog,
     ToolExecutor,
     ToolResult,
+    _summarize,
     execute_pending_action,
 )
 from app.services.whatsapp import WhatsAppAPIError, WhatsAppClient
+from app.utils.search import generate_tags
 
 logger = logging.getLogger(__name__)
 
@@ -213,8 +217,21 @@ async def _process_interactive_reply(
     session: AsyncSession,
     inbound_message_id: Any,
     tool_executor: ToolExecutor,
+    memory_service: MemoryService | None = None,
 ) -> ToolExecutionLog:
     log = ToolExecutionLog()
+    memory_service = memory_service or MemoryService()
+
+    if interactive_id.startswith("confirm_forget_") or interactive_id.startswith(
+        "cancel_forget_"
+    ):
+        return await _process_forget_confirmation(
+            interactive_id=interactive_id,
+            user=user,
+            session=session,
+            memory_service=memory_service,
+        )
+
     parsed = parse_option_id(interactive_id)
     if parsed is None:
         log.replies.append("I don't have a pending request for that selection.")
@@ -250,9 +267,78 @@ async def _process_interactive_reply(
         return log
 
     option_payload = options[option_index]
-    selected_event = (
-        deserialize_event(option_payload) if isinstance(option_payload, dict) else None
+    if not isinstance(option_payload, dict):
+        clear_pending_action(user)
+        log.replies.append("That selection is no longer valid.")
+        log.results.append(
+            {
+                "tool": "disambiguation",
+                "success": False,
+                "data": {"reason": "invalid_option"},
+            }
+        )
+        return log
+
+    action_type = pending.get("type")
+
+    if action_type in {"calendar_update", "calendar_cancel"}:
+        return await _resume_calendar_disambiguation(
+            log=log,
+            pending=pending,
+            option_payload=option_payload,
+            disambig_id=disambig_id,
+            user=user,
+            session=session,
+            inbound_message_id=inbound_message_id,
+            tool_executor=tool_executor,
+        )
+
+    if action_type == "memory_update":
+        return await _resume_memory_update(
+            log=log,
+            pending=pending,
+            option_payload=option_payload,
+            disambig_id=disambig_id,
+            user=user,
+            session=session,
+            memory_service=memory_service,
+        )
+
+    if action_type == "memory_forget_pick":
+        return await _resume_memory_forget_pick(
+            log=log,
+            option_payload=option_payload,
+            disambig_id=disambig_id,
+            user=user,
+            session=session,
+            tool_executor=tool_executor,
+            memory_service=memory_service,
+        )
+
+    clear_pending_action(user)
+    log.replies.append("That selection has expired. Please ask again.")
+    log.results.append(
+        {
+            "tool": "disambiguation",
+            "success": False,
+            "data": {"reason": "unknown_pending_type"},
+        }
     )
+    return log
+
+
+async def _resume_calendar_disambiguation(
+    *,
+    log: ToolExecutionLog,
+    pending: dict[str, Any],
+    option_payload: dict[str, Any],
+    disambig_id: str,
+    user: User,
+    session: AsyncSession,
+    inbound_message_id: Any,
+    tool_executor: ToolExecutor,
+) -> ToolExecutionLog:
+    selected_event = deserialize_event(option_payload)
     if selected_event is None:
         clear_pending_action(user)
         log.replies.append("That selection is no longer valid.")
@@ -287,6 +373,206 @@ async def _process_interactive_reply(
     if (result.data or {}).get("sent_directly"):
         log.sent_directly = True
     return log
+
+
+async def _resume_memory_update(
+    *,
+    log: ToolExecutionLog,
+    pending: dict[str, Any],
+    option_payload: dict[str, Any],
+    disambig_id: str,
+    user: User,
+    session: AsyncSession,
+    memory_service: MemoryService,
+) -> ToolExecutionLog:
+    raw_id = option_payload.get("memory_id")
+    arguments = pending.get("arguments") or {}
+    new_content = arguments.get("new_content")
+    memory_uuid = _safe_uuid(raw_id)
+    if memory_uuid is None or not isinstance(new_content, str) or not new_content.strip():
+        clear_pending_action(user)
+        log.replies.append("That selection is no longer valid.")
+        log.results.append(
+            {
+                "tool": "memory_update",
+                "success": False,
+                "data": {"reason": "invalid_option"},
+            }
+        )
+        return log
+
+    memory = await memory_service.get_by_id(memory_uuid, user.id, session)
+    if memory is None:
+        clear_pending_action(user)
+        log.replies.append("That memory is no longer available.")
+        log.results.append(
+            {
+                "tool": "memory_update",
+                "success": False,
+                "data": {"reason": "memory_missing"},
+            }
+        )
+        return log
+
+    new_text = new_content.strip()
+    old_summary = _summarize(memory.content)
+    new_tags = await generate_tags(new_text)
+    await memory_service.update_content(
+        memory=memory, new_content=new_text, new_tags=new_tags, db=session
+    )
+    clear_pending_action(user)
+    log.replies.append(f"Updated: {old_summary} -> {_summarize(new_text)}")
+    log.results.append(
+        {
+            "tool": "memory_update",
+            "success": True,
+            "data": {"memory_id": str(memory.id)},
+            "disambiguation_id": disambig_id,
+        }
+    )
+    return log
+
+
+async def _resume_memory_forget_pick(
+    *,
+    log: ToolExecutionLog,
+    option_payload: dict[str, Any],
+    disambig_id: str,
+    user: User,
+    session: AsyncSession,
+    tool_executor: ToolExecutor,
+    memory_service: MemoryService,
+) -> ToolExecutionLog:
+    raw_id = option_payload.get("memory_id")
+    memory_uuid = _safe_uuid(raw_id)
+    if memory_uuid is None:
+        clear_pending_action(user)
+        log.replies.append("That selection is no longer valid.")
+        log.results.append(
+            {
+                "tool": "memory_forget",
+                "success": False,
+                "data": {"reason": "invalid_option"},
+            }
+        )
+        return log
+
+    memory = await memory_service.get_by_id(memory_uuid, user.id, session)
+    if memory is None:
+        clear_pending_action(user)
+        log.replies.append("That memory is no longer available.")
+        log.results.append(
+            {
+                "tool": "memory_forget",
+                "success": False,
+                "data": {"reason": "memory_missing"},
+            }
+        )
+        return log
+
+    clear_pending_action(user)
+    confirmation = await tool_executor._send_forget_confirmation(
+        user=user, db=session, memory=memory
+    )
+    if confirmation.message:
+        log.replies.append(confirmation.message)
+    log.results.append(
+        {
+            "tool": "memory_forget",
+            "success": confirmation.success,
+            "data": confirmation.data,
+            "disambiguation_id": disambig_id,
+        }
+    )
+    if (confirmation.data or {}).get("sent_directly"):
+        log.sent_directly = True
+    return log
+
+
+async def _process_forget_confirmation(
+    *,
+    interactive_id: str,
+    user: User,
+    session: AsyncSession,
+    memory_service: MemoryService,
+) -> ToolExecutionLog:
+    log = ToolExecutionLog()
+    if interactive_id.startswith("confirm_forget_"):
+        is_confirm = True
+        raw_id = interactive_id[len("confirm_forget_"):]
+    else:
+        is_confirm = False
+        raw_id = interactive_id[len("cancel_forget_"):]
+
+    pending = get_active_pending_action(user)
+    pending_id = (
+        pending.get("memory_id") if isinstance(pending, dict) else None
+    )
+    pending_type = pending.get("type") if isinstance(pending, dict) else None
+    memory_uuid = _safe_uuid(raw_id)
+
+    if (
+        pending is None
+        or pending_type != "memory_forget"
+        or pending_id != raw_id
+        or memory_uuid is None
+    ):
+        clear_pending_action(user)
+        log.replies.append("That selection has expired. Please ask again.")
+        log.results.append(
+            {
+                "tool": "memory_forget",
+                "success": False,
+                "data": {"reason": "expired_or_missing"},
+            }
+        )
+        return log
+
+    if not is_confirm:
+        clear_pending_action(user)
+        log.replies.append("Okay, keeping it.")
+        log.results.append(
+            {
+                "tool": "memory_forget",
+                "success": True,
+                "data": {"action": "cancelled", "memory_id": raw_id},
+            }
+        )
+        return log
+
+    memory = await memory_service.get_by_id(memory_uuid, user.id, session)
+    if memory is None:
+        clear_pending_action(user)
+        log.replies.append("That memory is no longer available.")
+        log.results.append(
+            {
+                "tool": "memory_forget",
+                "success": False,
+                "data": {"reason": "memory_missing"},
+            }
+        )
+        return log
+
+    await memory_service.forget(memory=memory, db=session)
+    clear_pending_action(user)
+    log.replies.append("Forgotten.")
+    log.results.append(
+        {
+            "tool": "memory_forget",
+            "success": True,
+            "data": {"action": "forgotten", "memory_id": str(memory.id)},
+        }
+    )
+    return log
+
+
+def _safe_uuid(value: Any) -> uuid.UUID | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
 
 
 async def _execute_tool_calls(

@@ -46,20 +46,36 @@ def set_pending_action(
     disambiguation_id: str,
     action_type: str,
     arguments: dict[str, Any],
-    options: list[ResolvedEvent],
+    options: list[ResolvedEvent] | list[dict[str, Any]],
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """Store a pending disambiguation on ``user.preferences_json``.
+
+    ``options`` may be ``ResolvedEvent`` instances (calendar disambiguation)
+    or plain ``dict`` payloads (e.g. memory disambiguation). ``extra`` is
+    merged into the parked payload for action-type-specific fields like
+    ``memory_id``.
 
     Reassigns the JSONB column so SQLAlchemy notices the change.
     """
     expires_at = datetime.now(timezone.utc) + PENDING_ACTION_TTL
-    payload = {
+    serialized_options: list[dict[str, Any]] = []
+    for opt in options:
+        if isinstance(opt, ResolvedEvent):
+            serialized_options.append(serialize_event(opt))
+        elif isinstance(opt, dict):
+            serialized_options.append(dict(opt))
+        else:  # pragma: no cover - defensive
+            raise TypeError(f"Unsupported pending-action option type: {type(opt)!r}")
+    payload: dict[str, Any] = {
         "id": disambiguation_id,
         "type": action_type,
         "arguments": arguments,
-        "options": [serialize_event(opt) for opt in options],
+        "options": serialized_options,
         "expires_at": expires_at.isoformat(),
     }
+    if extra:
+        payload.update(extra)
     prefs = dict(user.preferences_json or {})
     prefs[_PENDING_KEY] = payload
     user.preferences_json = prefs

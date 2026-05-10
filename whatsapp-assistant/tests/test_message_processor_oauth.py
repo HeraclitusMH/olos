@@ -42,14 +42,14 @@ async def test_executor_routes_ask_clarification_tool_call() -> None:
 async def test_executor_returns_not_implemented_for_unknown_tool() -> None:
     executor = ToolExecutor()
     result = await executor.execute(
-        "memory_store",
-        {"content": "x", "tags": ["a", "b"]},
+        "made_up_future_tool",
+        {},
         user=_DummyUser(),
         db=None,  # type: ignore[arg-type]
     )
 
     assert result.success is False
-    assert result.message == "Tool memory_store not yet implemented."
+    assert result.message == "Tool made_up_future_tool not yet implemented."
 
 
 async def test_executor_unauthorized_returns_authorize_link() -> None:

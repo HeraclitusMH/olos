@@ -11,8 +11,11 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import EventReference, GoogleAccount, Message, User
-from app.services.disambiguation import DisambiguationService
+from app.models import EventReference, GoogleAccount, Memory, Message, User
+from app.services.disambiguation import (
+    DisambiguationService,
+    build_option_id,
+)
 from app.services.event_resolver import EventResolver, ResolvedEvent, is_vague_title
 from app.services.google_auth import GoogleAuthService, build_authorization_url
 from app.services.google_calendar import (
@@ -21,11 +24,13 @@ from app.services.google_calendar import (
     GoogleCalendarService,
     GoogleCalendarUnauthorized,
 )
+from app.services.memory import MemoryService
 from app.services.pending_action import (
     clear_pending_action,
     set_pending_action,
 )
 from app.services.whatsapp import WhatsAppClient
+from app.utils.search import generate_tags
 from app.utils.timezone import (
     InvalidDateTimeError,
     format_date_range,
@@ -73,6 +78,7 @@ class ToolExecutor:
         calendar_service_factory=None,
         whatsapp_client_factory=None,
         disambiguation_service_factory=None,
+        memory_service_factory=None,
     ) -> None:
         self._google_auth_factory = google_auth_factory or (
             lambda session: GoogleAuthService(session)
@@ -87,6 +93,7 @@ class ToolExecutor:
             disambiguation_service_factory
             or (lambda client: DisambiguationService(client))
         )
+        self._memory_service_factory = memory_service_factory or MemoryService
 
     async def execute(
         self,
@@ -104,6 +111,10 @@ class ToolExecutor:
             "calendar_query": self.handle_calendar_query,
             "calendar_update": self.handle_calendar_update,
             "calendar_cancel": self.handle_calendar_cancel,
+            "memory_store": self.handle_memory_store,
+            "memory_retrieve": self.handle_memory_retrieve,
+            "memory_update": self.handle_memory_update,
+            "memory_forget": self.handle_memory_forget,
         }.get(tool_name)
 
         if handler is None:
@@ -424,6 +435,366 @@ class ToolExecutor:
             db=db,
             account=account,
             token=token,
+        )
+
+    # --- memory handlers ---------------------------------------------------
+
+    async def handle_memory_store(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        content = arguments.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return ToolResult(
+                success=False,
+                message="What should I remember?",
+                data={"tool": "memory_store", "reason": "missing_content"},
+            )
+        raw_tags = arguments.get("tags") or []
+        tags: list[str] = []
+        if isinstance(raw_tags, list):
+            for tag in raw_tags:
+                if isinstance(tag, str) and tag.strip():
+                    tags.append(tag.strip().lower())
+
+        memory_service = self._memory_service_factory()
+        memory = await memory_service.store(
+            user_id=user.id, content=content.strip(), tags=tags or None, db=db
+        )
+
+        return ToolResult(
+            success=True,
+            message=f"Saved: {_summarize(memory.content)}",
+            data={
+                "tool": "memory_store",
+                "memory_id": str(memory.id),
+                "tags": list(memory.tags or []),
+            },
+        )
+
+    async def handle_memory_retrieve(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return ToolResult(
+                success=False,
+                message="What should I look up?",
+                data={"tool": "memory_retrieve", "reason": "missing_query"},
+            )
+
+        memory_service = self._memory_service_factory()
+        matches = await memory_service.retrieve(
+            user_id=user.id, query=query, db=db, limit=3
+        )
+        if not matches:
+            return ToolResult(
+                success=True,
+                message="I do not have anything stored about that.",
+                data={"tool": "memory_retrieve", "count": 0},
+            )
+        if len(matches) == 1:
+            return ToolResult(
+                success=True,
+                message=matches[0].content,
+                data={
+                    "tool": "memory_retrieve",
+                    "count": 1,
+                    "memory_id": str(matches[0].id),
+                },
+            )
+        lines = [f"{idx}. {m.content}" for idx, m in enumerate(matches, 1)]
+        return ToolResult(
+            success=True,
+            message="\n".join(lines),
+            data={
+                "tool": "memory_retrieve",
+                "count": len(matches),
+                "memory_ids": [str(m.id) for m in matches],
+            },
+        )
+
+    async def handle_memory_update(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        query = arguments.get("query")
+        new_content = arguments.get("new_content")
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or not isinstance(new_content, str)
+            or not new_content.strip()
+        ):
+            return ToolResult(
+                success=False,
+                message="What memory should I update, and to what?",
+                data={"tool": "memory_update", "reason": "missing_args"},
+            )
+
+        memory_service = self._memory_service_factory()
+        matches = await memory_service.retrieve(
+            user_id=user.id, query=query, db=db, limit=3
+        )
+        if not matches:
+            return ToolResult(
+                success=False,
+                message="Could not find a memory matching that.",
+                data={"tool": "memory_update", "reason": "not_found"},
+            )
+        if len(matches) > 1:
+            return await self._send_memory_update_disambiguation(
+                user=user,
+                db=db,
+                memories=matches,
+                query=query,
+                new_content=new_content.strip(),
+            )
+
+        memory = matches[0]
+        old_summary = _summarize(memory.content)
+        new_text = new_content.strip()
+        new_tags = await generate_tags(new_text)
+        await memory_service.update_content(
+            memory=memory, new_content=new_text, new_tags=new_tags, db=db
+        )
+        return ToolResult(
+            success=True,
+            message=f"Updated: {old_summary} -> {_summarize(new_text)}",
+            data={
+                "tool": "memory_update",
+                "memory_id": str(memory.id),
+            },
+        )
+
+    async def handle_memory_forget(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return ToolResult(
+                success=False,
+                message="What should I forget?",
+                data={"tool": "memory_forget", "reason": "missing_query"},
+            )
+
+        memory_service = self._memory_service_factory()
+        matches = await memory_service.retrieve(
+            user_id=user.id, query=query, db=db, limit=3
+        )
+        if not matches:
+            return ToolResult(
+                success=False,
+                message="Could not find a memory matching that.",
+                data={"tool": "memory_forget", "reason": "not_found"},
+            )
+        if len(matches) > 1:
+            return await self._send_memory_forget_disambiguation(
+                user=user, db=db, memories=matches, query=query
+            )
+
+        return await self._send_forget_confirmation(
+            user=user, db=db, memory=matches[0]
+        )
+
+    async def _send_forget_confirmation(
+        self, *, user: User, db: AsyncSession, memory: Memory
+    ) -> ToolResult:
+        preview = _summarize(memory.content, length=80)
+        body_text = f"Are you sure you want to forget: {preview}?"
+        memory_id = str(memory.id)
+        buttons = [
+            {
+                "type": "reply",
+                "reply": {
+                    "id": f"confirm_forget_{memory_id}",
+                    "title": "Yes, forget it",
+                },
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": f"cancel_forget_{memory_id}",
+                    "title": "No, keep it",
+                },
+            },
+        ]
+        client = self._whatsapp_client_factory()
+        try:
+            await client.send_interactive_buttons(
+                to=user.wa_id, body_text=body_text, buttons=buttons
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send forget confirmation for user=%s", user.id
+            )
+            return ToolResult(
+                success=False,
+                message="I couldn't send the confirmation prompt. Try again.",
+                data={
+                    "tool": "memory_forget",
+                    "reason": "confirmation_send_failed",
+                },
+            )
+
+        set_pending_action(
+            user,
+            disambiguation_id=memory_id,
+            action_type="memory_forget",
+            arguments={"memory_id": memory_id},
+            options=[],
+            extra={"memory_id": memory_id},
+        )
+        await db.flush()
+
+        return ToolResult(
+            success=True,
+            message="",
+            data={
+                "tool": "memory_forget",
+                "reason": "confirmation_pending",
+                "memory_id": memory_id,
+                "sent_directly": True,
+            },
+        )
+
+    async def _send_memory_update_disambiguation(
+        self,
+        *,
+        user: User,
+        db: AsyncSession,
+        memories: list[Memory],
+        query: str,
+        new_content: str,
+    ) -> ToolResult:
+        return await self._send_memory_disambiguation(
+            user=user,
+            db=db,
+            memories=memories,
+            action_type="memory_update",
+            body_text="Which memory should I update?",
+            button_label="Pick memory",
+            arguments={"query": query, "new_content": new_content},
+        )
+
+    async def _send_memory_forget_disambiguation(
+        self,
+        *,
+        user: User,
+        db: AsyncSession,
+        memories: list[Memory],
+        query: str,
+    ) -> ToolResult:
+        return await self._send_memory_disambiguation(
+            user=user,
+            db=db,
+            memories=memories,
+            action_type="memory_forget_pick",
+            body_text="Which memory should I forget?",
+            button_label="Pick memory",
+            arguments={"query": query},
+        )
+
+    async def _send_memory_disambiguation(
+        self,
+        *,
+        user: User,
+        db: AsyncSession,
+        memories: list[Memory],
+        action_type: str,
+        body_text: str,
+        button_label: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        disambiguation_id = uuid.uuid4().hex
+        options_payload = [
+            {"memory_id": str(m.id), "snippet": _summarize(m.content)}
+            for m in memories
+        ]
+        client = self._whatsapp_client_factory()
+
+        try:
+            if len(memories) <= 3:
+                buttons = [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": build_option_id(disambiguation_id, idx),
+                            "title": _truncate(_summarize(m.content, 18), 20),
+                        },
+                    }
+                    for idx, m in enumerate(memories)
+                ]
+                await client.send_interactive_buttons(
+                    to=user.wa_id, body_text=body_text, buttons=buttons
+                )
+            else:
+                rows = [
+                    {
+                        "id": build_option_id(disambiguation_id, idx),
+                        "title": _truncate(_summarize(m.content, 22), 24),
+                        "description": "",
+                    }
+                    for idx, m in enumerate(memories)
+                ]
+                await client.send_interactive_list(
+                    to=user.wa_id,
+                    body_text=body_text,
+                    button_text=button_label,
+                    sections=[{"title": "Memories", "rows": rows}],
+                )
+        except Exception:
+            logger.exception(
+                "Failed to send memory disambiguation for user=%s", user.id
+            )
+            return ToolResult(
+                success=False,
+                message=(
+                    "I found a few matching memories. Try again with more detail."
+                ),
+                data={
+                    "tool": action_type,
+                    "reason": "disambiguation_send_failed",
+                },
+            )
+
+        set_pending_action(
+            user,
+            disambiguation_id=disambiguation_id,
+            action_type=action_type,
+            arguments=arguments,
+            options=options_payload,
+        )
+        await db.flush()
+
+        return ToolResult(
+            success=True,
+            message="",
+            data={
+                "tool": action_type,
+                "reason": "disambiguation",
+                "disambiguation_id": disambiguation_id,
+                "options_count": len(memories),
+                "sent_directly": True,
+            },
         )
 
     # --- internal helpers --------------------------------------------------
@@ -837,6 +1208,23 @@ async def _load_recent_messages(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+def _summarize(content: str, length: int = 50) -> str:
+    """First ``length`` chars of ``content`` plus an ellipsis when truncated."""
+    text = content.strip()
+    if len(text) <= length:
+        return text
+    return text[:length] + "..."
+
+
+def _truncate(value: str, max_len: int) -> str:
+    """Truncate while reserving 3 chars for the ellipsis when possible."""
+    if len(value) <= max_len:
+        return value
+    if max_len <= 3:
+        return value[:max_len]
+    return value[: max_len - 3] + "..."
 
 
 async def _delete_event_reference(
