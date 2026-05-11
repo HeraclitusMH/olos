@@ -9,10 +9,12 @@ import pytest
 from app.config import get_settings
 from app.models import GoogleAccount
 from app.services.google_auth import (
+    GoogleAuthError,
     GoogleAuthService,
     build_authorization_url,
 )
 from app.utils.encryption import TokenEncryption
+from app.utils.exceptions import TokenExpiredError
 
 
 class _AccountSession:
@@ -147,11 +149,12 @@ async def test_get_valid_token_refreshes_when_already_expired() -> None:
     assert await service.get_valid_token(account.user_id) == "ya29.refreshed"
 
 
-async def test_get_valid_token_returns_none_when_revoked() -> None:
+async def test_get_valid_token_raises_when_revoked() -> None:
     account, enc = _make_account(status="revoked")
     session = _AccountSession(account)
     service = GoogleAuthService(session, encryption=enc)  # type: ignore[arg-type]
-    assert await service.get_valid_token(account.user_id) is None
+    with pytest.raises(TokenExpiredError):
+        await service.get_valid_token(account.user_id)
 
 
 async def test_get_valid_token_returns_none_when_no_account() -> None:
@@ -170,9 +173,38 @@ async def test_get_valid_token_marks_revoked_on_refresh_4xx() -> None:
         http_client_factory=_http_factory_returning(response),
     )
 
-    assert await service.get_valid_token(account.user_id) is None
+    with pytest.raises(TokenExpiredError):
+        await service.get_valid_token(account.user_id)
     assert account.status == "revoked"
     assert session.commit_count == 1
+
+
+async def test_get_valid_token_raises_transient_on_network_error() -> None:
+    account, enc = _make_account(expires_in_seconds=10)
+    session = _AccountSession(account)
+
+    class _ExplodingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            import httpx as _httpx
+
+            raise _httpx.ConnectError("boom")
+
+    service = GoogleAuthService(
+        session,  # type: ignore[arg-type]
+        encryption=enc,
+        http_client_factory=lambda: _ExplodingClient(),
+    )
+
+    with pytest.raises(GoogleAuthError):
+        await service.get_valid_token(account.user_id)
+    # Transient failure must not mark the account revoked.
+    assert account.status == "active"
 
 
 async def test_get_valid_token_marks_revoked_on_corrupted_access_token() -> None:
@@ -182,7 +214,8 @@ async def test_get_valid_token_marks_revoked_on_corrupted_access_token() -> None
     session = _AccountSession(account)
     service = GoogleAuthService(session, encryption=enc)  # type: ignore[arg-type]
 
-    assert await service.get_valid_token(account.user_id) is None
+    with pytest.raises(TokenExpiredError):
+        await service.get_valid_token(account.user_id)
     assert account.status == "revoked"
 
 
@@ -192,7 +225,8 @@ async def test_get_valid_token_marks_revoked_on_corrupted_refresh_token() -> Non
     session = _AccountSession(account)
     service = GoogleAuthService(session, encryption=enc)  # type: ignore[arg-type]
 
-    assert await service.get_valid_token(account.user_id) is None
+    with pytest.raises(TokenExpiredError):
+        await service.get_valid_token(account.user_id)
     assert account.status == "revoked"
 
 

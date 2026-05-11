@@ -56,9 +56,23 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - `app/utils/search.py`: `build_search_query` strips stopwords/single-char tokens before tsquery. `generate_tags` extracts simple tokens for update without an LLM round-trip.
 - `memory_forget` sends confirmation buttons first; actual soft-delete only on `confirm_forget_<id>` reply.
 
+## Error Handling & Hardening (Prompt 9)
+
+- Custom exception hierarchy lives in `app/utils/exceptions.py`: `AssistantError` base + `OpenAIError`, `GoogleCalendarError`, `TokenExpiredError`, `DailyLimitExceededError`, `WhatsAppSendError`. Each carries `user_message` (WhatsApp-safe) and `log_message`.
+- `app/utils/retry.py` — `async_retry(max_retries, delay, backoff, exceptions, jitter)`. Skips 4xx (except 429). Used by planner / calendar / whatsapp.
+- `app/utils/logging_config.py` — JSON structured logging; redacts tokens / Bearer / secrets. `configure_logging()` runs at import time from `app/main.py`.
+- Planner: handles OpenAI 429 by reading `Retry-After` and retrying ONCE, then raises `OpenAIError`. Transient OpenAI errors raise `OpenAIError` (no fallback reply). Malformed responses still fall back to a `reply` tool call.
+- Google Calendar: 5xx subclassed as `GoogleCalendarServerError` and retried once via `_request`. 403 with `rateLimitExceeded` mapped to `GoogleCalendarRateLimited`. Service-level `GoogleCalendarError` now inherits from the assistant-level one in `app/utils/exceptions.py`.
+- WhatsApp: 5xx retried via internal `_WhatsAppServerError`; 429 logged + raised (no retry); `WhatsAppAPIError` is now a subclass of `WhatsAppSendError`.
+- `GoogleAuthService.get_valid_token` contract: returns `None` only when no account exists; raises `TokenExpiredError` on revoked/invalid_grant/decryption failure; raises `GoogleAuthError` on transient (network) failure.
+- `ToolExecutor.execute` re-raises `AssistantError` so message_processor maps it; other exceptions still become a generic `ToolResult` failure.
+- `process_inbound_message` wraps work in `asyncio.wait_for(..., timeout=PROCESSING_TIMEOUT_SECONDS=25)` and a comprehensive try/except. On timeout or unhandled failure, `_finalize_failure` opens a fresh session to mark the row processed + send a fallback reply — the golden rule is no message is silently dropped.
+- Startup: `warn_about_unprocessed_messages()` logs (does NOT auto-retry) inbound rows older than 5 min that never got `processed=True`.
+- `/health` returns `{status: healthy|degraded|unhealthy, checks: {database, last_message_processed}}`. DB probe = `SELECT 1` + latency. Pipeline degraded when last processed > 5 min AND unprocessed rows exist.
+
 ## Current State
 
-- 235 unit tests pass with `python -m pytest -q`.
+- 254 unit tests pass with `python -m pytest -q`.
 - All planner tools implemented: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`, `memory_store`, `memory_retrieve`, `memory_update`, `memory_forget`.
 - Interactive webhook replies (button_reply, list_reply) are parsed and routed through the disambiguation resume flow.
 - Google OAuth flow wired end-to-end (`/authorize` → consent → `/callback` → encrypted token storage).

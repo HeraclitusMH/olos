@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import httpx
 
+from app.utils.exceptions import GoogleCalendarError as _BaseCalendarError
+from app.utils.retry import async_retry
+
 logger = logging.getLogger(__name__)
 
 
-class GoogleCalendarError(Exception):
-    """Generic Google Calendar API failure."""
+class GoogleCalendarError(_BaseCalendarError):
+    """Generic Google Calendar API failure (any non-2xx response)."""
 
     def __init__(self, status_code: int | None, body: str) -> None:
-        super().__init__(f"Google Calendar API error {status_code}: {body}")
         self.status_code = status_code
         self.body = body
+        super().__init__(
+            log_message=f"Google Calendar API error {status_code}: {body}",
+        )
+
+    def __str__(self) -> str:  # pragma: no cover - cosmetic
+        return f"Google Calendar API error {self.status_code}: {self.body}"
 
 
 class GoogleCalendarUnauthorized(GoogleCalendarError):
@@ -25,6 +34,18 @@ class GoogleCalendarUnauthorized(GoogleCalendarError):
 
 class GoogleCalendarRateLimited(GoogleCalendarError):
     """Raised on a 429 from Google Calendar."""
+
+
+class GoogleCalendarServerError(GoogleCalendarError):
+    """Raised on a 5xx — retry inside the service before bubbling up."""
+
+
+# httpx transport-level errors we retry automatically.
+_TRANSPORT_EXCS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
 
 
 class GoogleCalendarService:
@@ -64,7 +85,45 @@ class GoogleCalendarService:
             raise GoogleCalendarUnauthorized(response.status_code, body)
         if response.status_code == 429:
             raise GoogleCalendarRateLimited(response.status_code, body)
+        if response.status_code == 403 and _is_rate_limit_exceeded(response):
+            # Google's app-level quota burst signal — distinct from 429.
+            raise GoogleCalendarRateLimited(response.status_code, body)
+        if response.status_code >= 500:
+            raise GoogleCalendarServerError(response.status_code, body)
         raise GoogleCalendarError(response.status_code, body)
+
+    @async_retry(
+        max_retries=1,
+        delay=0.2,
+        backoff=2.0,
+        exceptions=_TRANSPORT_EXCS + (GoogleCalendarServerError,),
+    )
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        async with self._http_client_factory() as client:
+            method_lower = method.lower()
+            callable_ = getattr(client, method_lower)
+            response = await callable_(url, headers=self._headers, **kwargs)
+        self._raise_for_status(response)
+        return response
+
+    async def _request_handling_rate_limit(
+        self, method: str, url: str, **kwargs: Any
+    ) -> httpx.Response:
+        """Like ``_request`` but waits 1s and retries once on 429."""
+        try:
+            return await self._request(method, url, **kwargs)
+        except GoogleCalendarRateLimited:
+            logger.warning(
+                "Google Calendar rate-limited — sleeping 1s and retrying once",
+                extra={"event": "calendar.rate_limited"},
+            )
+            await asyncio.sleep(1.0)
+            return await self._request(method, url, **kwargs)
 
     async def create_event(
         self,
@@ -82,11 +141,9 @@ class GoogleCalendarService:
         if description:
             body["description"] = description
 
-        async with self._http_client_factory() as client:
-            response = await client.post(
-                self._events_url(), headers=self._headers, json=body
-            )
-        self._raise_for_status(response)
+        response = await self._request_handling_rate_limit(
+            "POST", self._events_url(), json=body
+        )
         return response.json()
 
     async def list_events(
@@ -106,38 +163,40 @@ class GoogleCalendarService:
         if query:
             params["q"] = query
 
-        async with self._http_client_factory() as client:
-            response = await client.get(
-                self._events_url(), headers=self._headers, params=params
-            )
-        self._raise_for_status(response)
+        response = await self._request_handling_rate_limit(
+            "GET", self._events_url(), params=params
+        )
         return list(response.json().get("items") or [])
 
     async def get_event(self, event_id: str) -> dict[str, Any]:
-        async with self._http_client_factory() as client:
-            response = await client.get(
-                self._events_url(event_id), headers=self._headers
-            )
-        self._raise_for_status(response)
+        response = await self._request_handling_rate_limit(
+            "GET", self._events_url(event_id)
+        )
         return response.json()
 
     async def update_event(
         self, event_id: str, updates: dict[str, Any]
     ) -> dict[str, Any]:
-        async with self._http_client_factory() as client:
-            response = await client.patch(
-                self._events_url(event_id),
-                headers=self._headers,
-                json=updates,
-            )
-        self._raise_for_status(response)
+        response = await self._request_handling_rate_limit(
+            "PATCH", self._events_url(event_id), json=updates
+        )
         return response.json()
 
     async def delete_event(self, event_id: str) -> None:
-        async with self._http_client_factory() as client:
-            response = await client.delete(
-                self._events_url(event_id), headers=self._headers
-            )
-        if response.status_code == 204:
-            return
-        self._raise_for_status(response)
+        # ``_request`` already raises on >=400; a 204 (success-no-content) just
+        # falls through here without a return body.
+        await self._request_handling_rate_limit(
+            "DELETE", self._events_url(event_id)
+        )
+
+
+def _is_rate_limit_exceeded(response: httpx.Response) -> bool:
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    errors = (data.get("error") or {}).get("errors") or []
+    if not errors:
+        return False
+    reason = errors[0].get("reason") if isinstance(errors[0], dict) else None
+    return reason == "rateLimitExceeded"

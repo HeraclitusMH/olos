@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models import GoogleAccount
 from app.utils.encryption import TokenEncryption, TokenEncryptionError
+from app.utils.exceptions import TokenExpiredError
 from app.utils.oauth_state import OAuthStateCodec
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,11 @@ REFRESH_THRESHOLD_SECONDS = 5 * 60
 
 
 class GoogleAuthError(Exception):
-    """Generic Google auth failure (network/HTTP/decoding)."""
+    """Generic, *transient* Google auth failure (network/HTTP/decoding).
+
+    Distinct from :class:`app.utils.exceptions.TokenExpiredError`, which means
+    the user must reauthorize. ``GoogleAuthError`` means "try again later".
+    """
 
 
 class _RefreshRevokedError(Exception):
@@ -84,15 +89,23 @@ class GoogleAuthService:
         return account is not None and account.status == "active"
 
     async def get_valid_token(self, user_id: uuid.UUID) -> str | None:
-        """Return a usable access token, refreshing if needed.
+        """Return a usable access token.
 
-        Returns ``None`` when no account exists, the account is revoked, or
-        the refresh attempt is rejected (in which case the account is marked
-        revoked so the user can be prompted to re-authorize).
+        * ``None`` — no Google account is linked yet (caller should prompt the
+          user to authorize for the first time).
+        * raises :class:`TokenExpiredError` — the link is permanently broken
+          (revoked, ``invalid_grant``, or unrecoverable decrypt failure). The
+          caller must prompt the user to *re-authorize*.
+        * raises :class:`GoogleAuthError` — transient failure (network, 5xx).
+          Caller should surface a "try again later" message.
         """
         account = await self._get_account(user_id)
-        if account is None or account.status != "active":
+        if account is None:
             return None
+        if account.status != "active":
+            raise TokenExpiredError(
+                log_message=f"google_account user_id={user_id} status={account.status}"
+            )
 
         now = datetime.now(UTC)
         threshold = timedelta(seconds=REFRESH_THRESHOLD_SECONDS)
@@ -101,26 +114,32 @@ class GoogleAuthService:
         if account.token_expires_at - now > threshold:
             try:
                 return self._encryption.decrypt(account.access_token_enc)
-            except TokenEncryptionError:
+            except TokenEncryptionError as exc:
                 logger.error(
                     "Failed to decrypt access token for account=%s; marking revoked",
                     account.id,
                 )
                 account.status = "revoked"
                 await self._session.commit()
-                return None
+                raise TokenExpiredError(
+                    log_message=f"access token decrypt failed for account={account.id}"
+                ) from exc
 
         # Within refresh window — try to refresh.
         try:
             return await self.refresh_token(account)
-        except _RefreshRevokedError:
+        except _RefreshRevokedError as exc:
             logger.warning("Refresh rejected for account=%s; marking revoked", account.id)
             account.status = "revoked"
             await self._session.commit()
-            return None
-        except (httpx.HTTPError, GoogleAuthError):
-            logger.exception("Transient refresh failure for account=%s", account.id)
-            return None
+            raise TokenExpiredError(
+                log_message=f"refresh rejected for account={account.id}"
+            ) from exc
+        except (httpx.HTTPError, GoogleAuthError) as exc:
+            logger.warning(
+                "Transient refresh failure for account=%s: %s", account.id, exc
+            )
+            raise GoogleAuthError(str(exc)) from exc
 
     async def refresh_token(self, account: GoogleAccount) -> str:
         """Refresh ``account``'s access token in place.

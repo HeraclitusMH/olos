@@ -30,6 +30,7 @@ from app.services.pending_action import (
     set_pending_action,
 )
 from app.services.whatsapp import WhatsAppClient
+from app.utils.exceptions import AssistantError
 from app.utils.search import generate_tags
 from app.utils.timezone import (
     InvalidDateTimeError,
@@ -132,6 +133,10 @@ class ToolExecutor:
                 inbound_message_id=inbound_message_id,
                 preselected_event=preselected_event,
             )
+        except AssistantError:
+            # Surface domain errors (TokenExpiredError, GoogleCalendarError, …)
+            # to the message processor so it can map them to user-facing replies.
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception(
                 "Tool handler %s raised unexpectedly: %s", tool_name, exc

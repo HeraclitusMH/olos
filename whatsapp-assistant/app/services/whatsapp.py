@@ -8,17 +8,34 @@ from typing import Any
 import httpx
 
 from app.config import get_settings
+from app.utils.exceptions import WhatsAppSendError
+from app.utils.retry import async_retry
 
 logger = logging.getLogger(__name__)
 
 
-class WhatsAppAPIError(Exception):
+class WhatsAppAPIError(WhatsAppSendError):
     """Raised when the WhatsApp Cloud API returns a non-2xx response."""
 
     def __init__(self, status_code: int, body: str) -> None:
-        super().__init__(f"WhatsApp API error {status_code}: {body}")
         self.status_code = status_code
         self.body = body
+        super().__init__(log_message=f"WhatsApp API error {status_code}: {body}")
+
+    def __str__(self) -> str:  # pragma: no cover - cosmetic
+        return f"WhatsApp API error {self.status_code}: {self.body}"
+
+
+# Transport-level exceptions that should trigger a retry.
+_TRANSPORT_EXCS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
+
+
+class _WhatsAppServerError(WhatsAppAPIError):
+    """Internal marker for 5xx responses so the retry decorator only retries those."""
 
 
 class WhatsAppClient:
@@ -46,18 +63,44 @@ class WhatsAppClient:
             "Content-Type": "application/json",
         }
 
+    @async_retry(
+        max_retries=1,
+        delay=0.2,
+        backoff=2.0,
+        exceptions=_TRANSPORT_EXCS + (_WhatsAppServerError,),
+    )
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
                 self._messages_url, headers=self._headers, json=payload
             )
         if response.status_code >= 400:
+            if response.status_code == 429:
+                # Meta WA does not benefit from retry — log and surface.
+                logger.warning(
+                    "WhatsApp API rate-limited (429)",
+                    extra={
+                        "event": "whatsapp.rate_limited",
+                        "status_code": 429,
+                    },
+                )
+                raise WhatsAppAPIError(response.status_code, response.text)
+            if response.status_code >= 500:
+                raise _WhatsAppServerError(response.status_code, response.text)
             logger.error(
                 "WhatsApp API call failed: status=%s body=%s",
                 response.status_code,
                 response.text,
+                extra={
+                    "event": "whatsapp.send_failed",
+                    "status_code": response.status_code,
+                },
             )
             raise WhatsAppAPIError(response.status_code, response.text)
+        logger.info(
+            "WhatsApp send succeeded",
+            extra={"event": "whatsapp.send", "status_code": response.status_code},
+        )
         return response.json()
 
     async def send_text_message(self, to: str, text: str) -> dict[str, Any]:

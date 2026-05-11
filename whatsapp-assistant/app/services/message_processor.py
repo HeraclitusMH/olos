@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -17,6 +20,7 @@ from app.models import Message, User
 from app.services.context import build_conversation_context
 from app.services.cost_tracker import CostTracker
 from app.services.disambiguation import parse_option_id
+from app.services.google_auth import GoogleAuthError, build_authorization_url
 from app.services.memory import MemoryService
 from app.services.pending_action import (
     clear_pending_action,
@@ -32,9 +36,20 @@ from app.services.tool_executor import (
     execute_pending_action,
 )
 from app.services.whatsapp import WhatsAppAPIError, WhatsAppClient
+from app.utils.exceptions import (
+    AssistantError,
+    DailyLimitExceededError,
+    GoogleCalendarError,
+    OpenAIError,
+    TokenExpiredError,
+    WhatsAppSendError,
+)
 from app.utils.search import generate_tags
 
 logger = logging.getLogger(__name__)
+
+# Hard upper bound on per-message work; beyond this we surface a timeout reply.
+PROCESSING_TIMEOUT_SECONDS = 25
 
 
 @dataclass(frozen=True)
@@ -68,6 +83,23 @@ async def _is_duplicate(session: AsyncSession, wa_message_id: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+def _error_reply(exc: BaseException, user: User) -> str:
+    """Translate an AssistantError into a short WhatsApp-safe reply."""
+    if isinstance(exc, DailyLimitExceededError):
+        return "Hit my daily limit. Back tomorrow!"
+    if isinstance(exc, OpenAIError):
+        return "Having trouble thinking right now. Try again in a minute."
+    if isinstance(exc, TokenExpiredError):
+        url = build_authorization_url(user.wa_id)
+        return (
+            "Your Google connection expired. Please re-authorize: "
+            f"{url}"
+        )
+    if isinstance(exc, GoogleCalendarError):
+        return "Calendar temporarily unavailable."
+    return "Something went wrong."
+
+
 async def process_inbound_message(
     inbound: InboundMessage,
     *,
@@ -78,37 +110,106 @@ async def process_inbound_message(
 ) -> None:
     """Process one inbound WhatsApp message (text or interactive reply).
 
-    Steps: find/create user, dedupe by wa_message_id, store inbound message,
-    branch on whether it is an interactive reply (resume the parked
-    pending action) or a text message (plan + execute via the LLM
-    planner). Send the outbound reply if there is one to send.
+    Wraps the entire flow in a 25-second timeout and an outer try/except so a
+    failure is *always* reported back to the user and the inbound row is
+    *always* marked processed (the golden rule: no silent drops).
     """
     client = whatsapp_client or WhatsAppClient()
     planner = planner or Planner()
     cost_tracker = cost_tracker or CostTracker()
     tool_executor = tool_executor or ToolExecutor()
+    started = time.monotonic()
+
+    logger.info(
+        "Inbound message received",
+        extra={
+            "event": "inbound_message",
+            "wa_message_id": inbound.wa_message_id,
+            "wa_id": inbound.wa_id,
+            "is_interactive": inbound.interactive_id is not None,
+        },
+    )
 
     try:
-        async with AsyncSessionLocal() as session:
-            if await _is_duplicate(session, inbound.wa_message_id):
-                logger.info(
-                    "Duplicate inbound wa_message_id=%s — skipping",
-                    inbound.wa_message_id,
-                )
-                return
+        await asyncio.wait_for(
+            _do_process(
+                inbound,
+                client=client,
+                planner=planner,
+                cost_tracker=cost_tracker,
+                tool_executor=tool_executor,
+                started=started,
+            ),
+            timeout=PROCESSING_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.error(
+            "Processing exceeded %ds for wa_message_id=%s",
+            PROCESSING_TIMEOUT_SECONDS,
+            inbound.wa_message_id,
+            extra={
+                "event": "processing_timeout",
+                "wa_message_id": inbound.wa_message_id,
+            },
+        )
+        await _finalize_failure(
+            inbound,
+            client=client,
+            reply_text="That took too long. Please try again.",
+            error_label="processing_timeout",
+        )
+    except Exception:  # noqa: BLE001
+        # Last-resort guard: _do_process already catches everything, but if the
+        # session/commit step itself blows up we still need to mark the row.
+        logger.critical(
+            "Unhandled error processing inbound wa_message_id=%s",
+            inbound.wa_message_id,
+            exc_info=True,
+            extra={
+                "event": "processing_unhandled",
+                "wa_message_id": inbound.wa_message_id,
+            },
+        )
+        await _finalize_failure(
+            inbound,
+            client=client,
+            reply_text="Something went wrong.",
+            error_label="unhandled_exception",
+        )
 
-            user = await _get_or_create_user(session, inbound.wa_id)
 
-            inbound_msg = Message(
-                user_id=user.id,
-                wa_message_id=inbound.wa_message_id,
-                direction="inbound",
-                content=inbound.text,
-                processed=False,
+async def _do_process(
+    inbound: InboundMessage,
+    *,
+    client: WhatsAppClient,
+    planner: Planner,
+    cost_tracker: CostTracker,
+    tool_executor: ToolExecutor,
+    started: float,
+) -> None:
+    async with AsyncSessionLocal() as session:
+        if await _is_duplicate(session, inbound.wa_message_id):
+            logger.info(
+                "Duplicate inbound wa_message_id=%s — skipping",
+                inbound.wa_message_id,
             )
-            session.add(inbound_msg)
-            await session.flush()
+            return
 
+        user = await _get_or_create_user(session, inbound.wa_id)
+
+        inbound_msg = Message(
+            user_id=user.id,
+            wa_message_id=inbound.wa_message_id,
+            direction="inbound",
+            content=inbound.text,
+            processed=False,
+        )
+        session.add(inbound_msg)
+        await session.flush()
+
+        execution = ToolExecutionLog()
+        error_label: str | None = None
+        try:
             if inbound.interactive_id:
                 execution = await _process_interactive_reply(
                     interactive_id=inbound.interactive_id,
@@ -128,49 +229,179 @@ async def process_inbound_message(
                     planner=planner,
                     tool_executor=tool_executor,
                 )
-
-            reply_text = execution.combined_reply
-            send_error: str | None = None
-            api_response: dict | None = None
-            if reply_text:
-                try:
-                    api_response = await client.send_text_message(
-                        to=inbound.wa_id, text=reply_text
-                    )
-                except (WhatsAppAPIError, httpx.HTTPError) as exc:
-                    logger.exception(
-                        "Failed to send reply to wa_id=%s: %s", inbound.wa_id, exc
-                    )
-                    send_error = str(exc)
-
-            outbound_wa_id = _extract_outbound_message_id(api_response)
-            outbound_msg = Message(
-                user_id=user.id,
-                wa_message_id=outbound_wa_id,
-                direction="outbound",
-                content=reply_text,
-                processed=True,
-                error=send_error,
+        except DailyLimitExceededError as exc:
+            error_label = "daily_limit_exceeded"
+            execution = ToolExecutionLog(replies=[_error_reply(exc, user)])
+        except OpenAIError as exc:
+            error_label = "openai_error"
+            logger.warning(
+                "OpenAI error while processing message: %s",
+                exc.log_message,
+                extra={"event": "openai_error", "wa_message_id": inbound.wa_message_id},
             )
-            if execution.results:
-                outbound_msg.execution_result_json = {"results": execution.results}
-            session.add(outbound_msg)
-
-            inbound_msg.processed = True
-            if execution.results:
-                inbound_msg.execution_result_json = {"results": execution.results}
-
-            await session.commit()
-            logger.info(
-                "Processed inbound message wa_message_id=%s user_id=%s",
+            execution = ToolExecutionLog(replies=[_error_reply(exc, user)])
+        except TokenExpiredError as exc:
+            error_label = "token_expired"
+            logger.warning(
+                "Token expired: %s",
+                exc.log_message,
+                extra={"event": "token_expired", "wa_message_id": inbound.wa_message_id},
+            )
+            execution = ToolExecutionLog(replies=[_error_reply(exc, user)])
+        except GoogleAuthError as exc:
+            error_label = "google_auth_transient"
+            logger.warning(
+                "Transient Google auth failure: %s",
+                exc,
+                extra={
+                    "event": "google_auth_transient",
+                    "wa_message_id": inbound.wa_message_id,
+                },
+            )
+            execution = ToolExecutionLog(
+                replies=["Calendar temporarily unavailable."]
+            )
+        except GoogleCalendarError as exc:
+            error_label = "google_calendar_error"
+            logger.warning(
+                "Google Calendar error: %s",
+                exc.log_message,
+                extra={
+                    "event": "google_calendar_error",
+                    "wa_message_id": inbound.wa_message_id,
+                },
+            )
+            execution = ToolExecutionLog(replies=[_error_reply(exc, user)])
+        except AssistantError as exc:
+            error_label = "assistant_error"
+            logger.error(
+                "Unhandled assistant error: %s",
+                exc.log_message,
+                exc_info=True,
+                extra={
+                    "event": "assistant_error",
+                    "wa_message_id": inbound.wa_message_id,
+                },
+            )
+            execution = ToolExecutionLog(replies=[_error_reply(exc, user)])
+        except Exception:  # noqa: BLE001
+            error_label = "unhandled_exception"
+            logger.critical(
+                "Unexpected error processing message wa_message_id=%s",
                 inbound.wa_message_id,
-                user.id,
+                exc_info=True,
+                extra={
+                    "event": "unhandled_exception",
+                    "wa_message_id": inbound.wa_message_id,
+                },
             )
-    except Exception:
+            execution = ToolExecutionLog(replies=["Something went wrong."])
+
+        reply_text = execution.combined_reply
+        send_error: str | None = None
+        api_response: dict | None = None
+        if reply_text:
+            try:
+                api_response = await client.send_text_message(
+                    to=inbound.wa_id, text=reply_text
+                )
+            except (WhatsAppSendError, WhatsAppAPIError, httpx.HTTPError) as exc:
+                logger.exception(
+                    "Failed to send reply to wa_id=%s: %s",
+                    inbound.wa_id,
+                    exc,
+                    extra={
+                        "event": "whatsapp_send_failed",
+                        "wa_message_id": inbound.wa_message_id,
+                    },
+                )
+                send_error = str(exc)
+
+        outbound_wa_id = _extract_outbound_message_id(api_response)
+        outbound_msg = Message(
+            user_id=user.id,
+            wa_message_id=outbound_wa_id,
+            direction="outbound",
+            content=reply_text,
+            processed=True,
+            error=send_error,
+        )
+        if execution.results:
+            outbound_msg.execution_result_json = {"results": execution.results}
+        session.add(outbound_msg)
+
+        inbound_msg.processed = True
+        if execution.results:
+            inbound_msg.execution_result_json = {"results": execution.results}
+        if error_label is not None:
+            inbound_msg.error = error_label
+        duration_ms = int((time.monotonic() - started) * 1000)
+        inbound_msg.processing_duration_ms = duration_ms
+
+        await session.commit()
+        logger.info(
+            "Processed inbound message",
+            extra={
+                "event": "processed",
+                "wa_message_id": inbound.wa_message_id,
+                "user_id": str(user.id),
+                "duration_ms": duration_ms,
+                "error": error_label,
+            },
+        )
+
+
+async def _finalize_failure(
+    inbound: InboundMessage,
+    *,
+    client: WhatsAppClient,
+    reply_text: str,
+    error_label: str,
+) -> None:
+    """Mark the inbound row processed and try to notify the user.
+
+    Called when the normal session lifecycle inside ``_do_process`` could not
+    complete (timeout, unhandled exception). Opens a fresh session so we never
+    leave a row sitting with ``processed=False`` after a hard failure.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            row = await session.execute(
+                select(Message).where(
+                    Message.wa_message_id == inbound.wa_message_id,
+                    Message.direction == "inbound",
+                )
+            )
+            inbound_msg = row.scalar_one_or_none()
+            if inbound_msg is None:
+                # The row never made it in — create a stub so we don't lose the
+                # message in the audit trail.
+                user = await _get_or_create_user(session, inbound.wa_id)
+                inbound_msg = Message(
+                    user_id=user.id,
+                    wa_message_id=inbound.wa_message_id,
+                    direction="inbound",
+                    content=inbound.text,
+                    processed=True,
+                    error=error_label,
+                )
+                session.add(inbound_msg)
+            else:
+                inbound_msg.processed = True
+                inbound_msg.error = error_label
+            await session.commit()
+    except Exception:  # noqa: BLE001 - last resort
         logger.critical(
-            "Unhandled error processing inbound wa_message_id=%s",
+            "Failed to finalize inbound row after failure for wa_message_id=%s",
             inbound.wa_message_id,
             exc_info=True,
+        )
+
+    try:
+        await client.send_text_message(to=inbound.wa_id, text=reply_text)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not send fallback reply to wa_id=%s", inbound.wa_id
         )
 
 
@@ -191,8 +422,7 @@ async def _process_text_message(
     execution = ToolExecutionLog()
 
     if not await cost_tracker.check_limit(session):
-        execution.replies.append("Daily limit reached. Try again tomorrow!")
-        return execution
+        raise DailyLimitExceededError("daily OpenAI request budget reached")
 
     await cost_tracker.increment(session)
     tool_calls = await planner.plan(
@@ -617,3 +847,36 @@ def _extract_outbound_message_id(api_response: dict | None) -> str | None:
     if not messages:
         return None
     return messages[0].get("id")
+
+
+async def warn_about_unprocessed_messages() -> None:
+    """Log a warning for messages that never finished processing.
+
+    Called once at startup. Does NOT auto-retry — we surface visibility and
+    leave recovery decisions to the operator.
+    """
+    cutoff = datetime.now(UTC) - timedelta(minutes=5)
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Message.id, Message.wa_message_id, Message.created_at)
+                .where(Message.processed.is_(False))
+                .where(Message.created_at < cutoff)
+            )
+            stuck = result.all()
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not query unprocessed messages on startup")
+        return
+
+    if not stuck:
+        return
+
+    logger.warning(
+        "Found %d unprocessed messages older than 5 minutes; manual review required",
+        len(stuck),
+        extra={
+            "event": "unprocessed_messages",
+            "count": len(stuck),
+            "wa_message_ids": [row.wa_message_id for row in stuck],
+        },
+    )
