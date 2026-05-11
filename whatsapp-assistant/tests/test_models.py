@@ -19,7 +19,15 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from app.database import Base
-from app.models import DailyApiUsage, EventReference, GoogleAccount, Memory, Message, User
+from app.models import (
+    DailyAgendaSend,
+    DailyApiUsage,
+    EventReference,
+    GoogleAccount,
+    Memory,
+    Message,
+    User,
+)
 
 
 # ---------- metadata registration ----------
@@ -33,6 +41,7 @@ def test_all_models_registered_in_metadata() -> None:
         "event_references",
         "memories",
         "daily_api_usage",
+        "daily_agenda_sends",
     }
 
 
@@ -387,3 +396,41 @@ def test_daily_api_usage_timestamps() -> None:
     assert created_at.type.timezone is True
     assert created_at.server_default.arg.text == "now()"
     assert updated_at.onupdate is not None
+
+
+# ---------- DailyAgendaSend ----------
+
+
+def test_daily_agenda_send_tablename() -> None:
+    assert DailyAgendaSend.__tablename__ == "daily_agenda_sends"
+
+
+def test_daily_agenda_send_user_fk_required() -> None:
+    col = DailyAgendaSend.__table__.c.user_id
+    assert col.nullable is False
+    fks = list(col.foreign_keys)
+    assert len(fks) == 1
+    assert fks[0].column.table.name == "users"
+
+
+def test_daily_agenda_send_unique_constraint() -> None:
+    names = {
+        c.name
+        for c in DailyAgendaSend.__table__.constraints
+        if c.name is not None
+    }
+    assert "uq_daily_agenda_user_date" in names
+
+
+def test_daily_agenda_send_agenda_date_is_date_not_null() -> None:
+    col = DailyAgendaSend.__table__.c.agenda_date
+    assert isinstance(col.type, Date)
+    assert col.nullable is False
+
+
+def test_daily_agenda_send_sent_at_default_now() -> None:
+    col = DailyAgendaSend.__table__.c.sent_at
+    assert isinstance(col.type, DateTime)
+    assert col.type.timezone is True
+    assert col.nullable is False
+    assert col.server_default.arg.text == "now()"

@@ -1,3 +1,4 @@
+from app.models.daily_agenda_send import DailyAgendaSend
 from app.models.daily_api_usage import DailyApiUsage
 from app.models.event_reference import EventReference
 from app.models.google_account import GoogleAccount
@@ -12,4 +13,5 @@ __all__ = [
     "EventReference",
     "Memory",
     "DailyApiUsage",
+    "DailyAgendaSend",
 ]

@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     daily_api_limit: int = 100
     default_timezone: str = "Europe/Madrid"
 
+    # Daily agenda scheduler
+    daily_agenda_default_timezone: str = "Asia/Makassar"
+    daily_agenda_default_time_local: str = "08:00"
+    daily_agenda_tick_seconds: int = 60
+    daily_agenda_send_window_minutes: int = 5
+
 
 @lru_cache
 def get_settings() -> Settings:

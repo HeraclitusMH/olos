@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -11,18 +12,38 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.database import AsyncSessionLocal
 from app.models import Message
 from app.routers import oauth, webhooks
+from app.services.daily_agenda import scheduler_loop
 from app.services.message_processor import warn_about_unprocessed_messages
+from app.utils.env_check import validate_environment
 from app.utils.logging_config import configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+# Fail fast on missing / malformed env vars before the app is constructed.
+validate_environment()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info("Application started", extra={"event": "app_started"})
     await warn_about_unprocessed_messages()
-    yield
+    stop_event = asyncio.Event()
+    scheduler_task = asyncio.create_task(
+        scheduler_loop(stop_event=stop_event), name="daily_agenda_scheduler"
+    )
+    try:
+        yield
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(scheduler_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 app = FastAPI(title="WhatsApp Personal Assistant", lifespan=lifespan)

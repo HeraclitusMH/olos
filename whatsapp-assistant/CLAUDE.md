@@ -10,11 +10,12 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Settings: `app/config.py:get_settings()` — never read `os.environ` in app code
 - Async DB engine/session/base: `app/database.py`
 - Routers: `app/routers/{webhooks,oauth}.py`
-- Services: `app/services/{whatsapp,message_processor,planner,context,cost_tracker,llm_tools,google_auth,google_calendar,tool_executor,event_resolver,disambiguation,pending_action,memory}.py`
-- Utils: `app/utils/{encryption,oauth_state,signature,timezone,generate_key,search}.py`
+- Services: `app/services/{whatsapp,message_processor,planner,context,cost_tracker,llm_tools,google_auth,google_calendar,tool_executor,event_resolver,disambiguation,pending_action,memory,daily_agenda}.py`
+- Utils: `app/utils/{encryption,oauth_state,signature,timezone,generate_key,search,env_check,exceptions,retry,logging_config}.py`
 - ORM models in `app/models/`, all re-exported from `app/models/__init__.py` so Alembic autogenerate sees them
-- Migrations: `alembic/versions/0001_initial_schema.py`, `0002_daily_api_usage.py`
+- Migrations: `alembic/versions/0001_initial_schema.py`, `0002_daily_api_usage.py`, `0003_daily_agenda_sends.py`
 - Tests: `tests/`, configured in `tests/conftest.py`
+- `app/main.py` lifespan starts `daily_agenda.scheduler_loop` as a background asyncio task; shutdown sets a stop event and joins (10s timeout, then cancel).
 
 ## Rules & Patterns
 
@@ -35,8 +36,9 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - User-facing dates formatted via `app/utils/timezone.py` (`format_event_time`, `format_date_range`), never raw ISO.
 - Tests must not require Docker or a live DB. Use `ASGITransport`; fake sessions / inject service factories. Migration tests parse files via `ast.parse`, never import the migration modules.
 - `pytest-asyncio` runs in `asyncio_mode = auto` — do not decorate tests with `@pytest.mark.asyncio`.
-- New secret settings must be added to both `.env.example` and `app/config.py:Settings`. `.env` is git-ignored.
-- Caddy terminates TLS; `api` container is not exposed on the host.
+- New secret settings must be added to both `.env.example` and `app/config.py:Settings`. `.env` is git-ignored. Host-only vars consumed by ops scripts (e.g. `B2_BUCKET`) go in `.env.example` only — not in `Settings`.
+- `app/main.py` calls `validate_environment()` (`app/utils/env_check.py`) at module import, after `configure_logging()` and before the FastAPI app is constructed. Missing/malformed required vars raise `SystemExit`. Tests rely on `tests/conftest.py:_TEST_ENV` being set before `app.main` is imported.
+- Caddy terminates TLS; `api` container is not exposed on the host. Dockerfile installs `curl` because the prod healthcheck shells out to it.
 - JSONB columns (`preferences_json`, etc.) require full reassignment to trigger SQLAlchemy dirty tracking — never mutate in place.
 - WhatsApp interactive messages: max 3 buttons (use list for 4+), button titles max 20 chars.
 
@@ -56,7 +58,16 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - `app/utils/search.py`: `build_search_query` strips stopwords/single-char tokens before tsquery. `generate_tags` extracts simple tokens for update without an LLM round-trip.
 - `memory_forget` sends confirmation buttons first; actual soft-delete only on `confirm_forget_<id>` reply.
 
-## Error Handling & Hardening (Prompt 9)
+## Daily Agenda Scheduler
+
+- Per-user prefs live at `user.preferences_json["daily_agenda"] = {enabled, timezone, time_local}`. Defaults from `Settings`: `Asia/Makassar` / `08:00`; tick 60s; send window 5 min. JSONB reassignment rule applies — use `daily_agenda.set_user_prefs`.
+- `DailyAgendaService.run_tick(now_utc)`: loads enabled users under a Postgres advisory lock (`pg_try_advisory_lock`), then per user computes due-window in their `ZoneInfo`, fetches Google Calendar events for `[day_start_local, day_end_local)`, sends WhatsApp, writes a `DailyAgendaSend(user_id, agenda_date)` row. Per-user failures are caught — one user must never break the batch.
+- Idempotency: `daily_agenda_sends` has `UNIQUE(user_id, agenda_date)`. The DB constraint — not the advisory lock — is the source of truth, so multi-replica and restarts are safe.
+- Revoked Google account (`TokenExpiredError`) or transient `GoogleAuthError` → skip the user silently for this tick, do not spam them.
+- Bad `timezone` / `time_local` fall back to defaults and log a warning (no secrets).
+- Agenda message header built explicitly (no `%-d` — non-portable on Windows). Time range uses an en-dash (`09:30–10:15`).
+
+## Error Handling & Hardening
 
 - Custom exception hierarchy lives in `app/utils/exceptions.py`: `AssistantError` base + `OpenAIError`, `GoogleCalendarError`, `TokenExpiredError`, `DailyLimitExceededError`, `WhatsAppSendError`. Each carries `user_message` (WhatsApp-safe) and `log_message`.
 - `app/utils/retry.py` — `async_retry(max_retries, delay, backoff, exceptions, jitter)`. Skips 4xx (except 429). Used by planner / calendar / whatsapp.
@@ -70,10 +81,18 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Startup: `warn_about_unprocessed_messages()` logs (does NOT auto-retry) inbound rows older than 5 min that never got `processed=True`.
 - `/health` returns `{status: healthy|degraded|unhealthy, checks: {database, last_message_processed}}`. DB probe = `SELECT 1` + latency. Pipeline degraded when last processed > 5 min AND unprocessed rows exist.
 
+## Deployment & Ops
+
+- Prod stack: `docker compose -f docker-compose.yml -f docker-compose.prod.yml`. Override adds `restart: always`, json-file log rotation (10m × 3), api memory cap 512M, api healthcheck (`curl /health`), db healthcheck (`pg_isready`), db `shm_size: 128mb`. DB is internal-only in both compose files.
+- Entry points: `./deploy.sh` (build + migrate + up + poll /health), `Makefile` (`dev`, `prod`, `migrate`, `migrate-create msg=…`, `backup`, `restore file=…`, `logs`, `shell`, `db-shell`, `health`, `clean`).
+- Ops scripts in `scripts/`: `backup.sh` (pg_dump → gzip → rclone B2, prune local >7d), `restore.sh` (drops + recreates DB, restores, verifies /health), `dev-tunnel.sh` (Cloudflare Tunnel), `vps-setup.sh` (one-time Ubuntu bootstrap: Docker, UFW 22/80/443, rclone, `/opt/whatsapp-assistant`).
+- Backups: rclone remote named `b2`, bucket from `$B2_BUCKET`, daily 3 AM cron. Step-by-step prod runbook in `DEPLOYMENT.md`.
+
 ## Current State
 
-- 254 unit tests pass with `python -m pytest -q`.
+- 283 unit tests pass with `python -m pytest -q`.
 - All planner tools implemented: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`, `memory_store`, `memory_retrieve`, `memory_update`, `memory_forget`.
+- Daily-agenda scheduler runs in-process from the lifespan; sends are gated by the `daily_agenda_sends` unique constraint.
 - Interactive webhook replies (button_reply, list_reply) are parsed and routed through the disambiguation resume flow.
 - Google OAuth flow wired end-to-end (`/authorize` → consent → `/callback` → encrypted token storage).
 - `pgvector==0.2.5` pinned but `vector` extension not yet enabled — the first migration adding an embedding column must run `CREATE EXTENSION IF NOT EXISTS vector`.
