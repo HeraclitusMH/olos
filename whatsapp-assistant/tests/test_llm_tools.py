@@ -14,6 +14,7 @@ def test_defines_all_planner_tools() -> None:
         "memory_update",
         "memory_forget",
         "reminder_create",
+        "set_timezone",
         "ask_clarification",
         "reply",
     }

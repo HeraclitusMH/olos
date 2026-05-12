@@ -243,6 +243,44 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "set_timezone",
+            "description": (
+                "Permanently update the user's timezone when they tell you "
+                "where they currently are or that they have moved. Use only "
+                "when the user expresses a persistent location, not for "
+                "transient mentions ('I'm in a meeting', 'at the gym'). "
+                "After this, all future calendar and reminder times are "
+                "interpreted in the new timezone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": (
+                            "IANA timezone name such as 'Asia/Makassar' "
+                            "(Bali), 'Europe/Rome', 'America/New_York'. "
+                            "Pick the closest canonical zone for the city or "
+                            "region the user named."
+                        ),
+                    },
+                    "location_label": {
+                        "type": "string",
+                        "description": (
+                            "Short human-readable location the user mentioned, "
+                            "e.g. 'Bali' or 'New York'. Used only in the "
+                            "confirmation message."
+                        ),
+                    },
+                },
+                "required": ["timezone"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_clarification",
             "description": "Ask the user a short question when critical information is missing.",
             "parameters": {
@@ -293,5 +331,6 @@ Rules:
 6. When user references previous message ("move IT", "cancel THAT"), use conversation context.
 7. Keep replies short and actionable. No fluff.
 8. Use reply tool for greetings, thank-yous, simple conversational responses.
-9. For reminders: when the user asks to be reminded at a specific time or after a delay, use the reminder_create tool. Compute the exact remind_at datetime from the current time above and the user's request, in the user's timezone. For relative times like "in 5 minutes", add exactly that duration to the current datetime. For "tomorrow at 9am", compute the next occurrence of 09:00 in the user's timezone. Always return remind_at as an ISO 8601 datetime with timezone offset."""
+9. For reminders: when the user asks to be reminded at a specific time or after a delay, use the reminder_create tool. Compute the exact remind_at datetime from the current time above and the user's request, in the user's timezone. For relative times like "in 5 minutes", add exactly that duration to the current datetime. For "tomorrow at 9am", compute the next occurrence of 09:00 in the user's timezone. Always return remind_at as an ISO 8601 datetime with timezone offset.
+10. For timezone changes: when the user says where they are or that they have moved ("I'm in Bali", "I'm now in Tokyo", "moved back to Rome"), call set_timezone with the matching IANA zone (e.g. Bali -> Asia/Makassar, NYC -> America/New_York, Rome -> Europe/Rome). If the location is too ambiguous to map to one zone (e.g. just "the US"), use ask_clarification instead. Do not call set_timezone for transient phrases like "in a meeting" or "at the gym"."""
 

@@ -7,3 +7,4 @@ caddy_data/
 .idea/
 .vscode/
 *.egg-info/
+commands.txt

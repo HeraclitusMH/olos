@@ -120,6 +120,7 @@ class ToolExecutor:
             "memory_update": self.handle_memory_update,
             "memory_forget": self.handle_memory_forget,
             "reminder_create": self.handle_reminder_create,
+            "set_timezone": self.handle_set_timezone,
         }.get(tool_name)
 
         if handler is None:
@@ -702,6 +703,78 @@ class ToolExecutor:
                 "tool": "reminder_create",
                 "reminder_id": str(reminder.id),
                 "remind_at": remind_at.isoformat(),
+            },
+        )
+
+    async def handle_set_timezone(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        raw_timezone = arguments.get("timezone")
+        if not isinstance(raw_timezone, str) or not raw_timezone.strip():
+            return ToolResult(
+                success=False,
+                message="Where are you? Tell me a city or region.",
+                data={"tool": "set_timezone", "reason": "missing_timezone"},
+            )
+
+        candidate = raw_timezone.strip()
+        try:
+            ZoneInfo(candidate)
+        except ZoneInfoNotFoundError:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"I don't recognize the timezone '{candidate}'. "
+                    "Try a city name like 'Bali' or 'Tokyo'."
+                ),
+                data={
+                    "tool": "set_timezone",
+                    "reason": "unknown_timezone",
+                    "timezone": candidate,
+                },
+            )
+
+        previous = user.timezone
+        if previous == candidate:
+            return ToolResult(
+                success=True,
+                message=f"Already set to {candidate}.",
+                data={
+                    "tool": "set_timezone",
+                    "timezone": candidate,
+                    "unchanged": True,
+                },
+            )
+
+        user.timezone = candidate
+        await db.flush()
+
+        label = arguments.get("location_label")
+        if isinstance(label, str) and label.strip():
+            message = (
+                f"Got it, you're in {label.strip()} ({candidate}). "
+                "Future times will use this timezone."
+            )
+        else:
+            message = (
+                f"Timezone updated to {candidate}. "
+                "Future times will use this timezone."
+            )
+
+        return ToolResult(
+            success=True,
+            message=message,
+            data={
+                "tool": "set_timezone",
+                "timezone": candidate,
+                "previous_timezone": previous,
             },
         )
 
