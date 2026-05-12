@@ -8,3 +8,6 @@ caddy_data/
 .vscode/
 *.egg-info/
 commands.txt
+.claude/
+*.stackdump
+*.docx
