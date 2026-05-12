@@ -26,6 +26,7 @@ from app.models import (
     GoogleAccount,
     Memory,
     Message,
+    Reminder,
     User,
 )
 
@@ -42,6 +43,7 @@ def test_all_models_registered_in_metadata() -> None:
         "memories",
         "daily_api_usage",
         "daily_agenda_sends",
+        "reminders",
     }
 
 

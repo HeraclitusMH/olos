@@ -4,6 +4,7 @@ from app.models.event_reference import EventReference
 from app.models.google_account import GoogleAccount
 from app.models.memory import Memory
 from app.models.message import Message
+from app.models.reminder import Reminder
 from app.models.user import User
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "Memory",
     "DailyApiUsage",
     "DailyAgendaSend",
+    "Reminder",
 ]

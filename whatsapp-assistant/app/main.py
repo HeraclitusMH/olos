@@ -14,6 +14,7 @@ from app.models import Message
 from app.routers import oauth, webhooks
 from app.services.daily_agenda import scheduler_loop
 from app.services.message_processor import warn_about_unprocessed_messages
+from app.services.reminder import reminder_scheduler_loop, reminder_stop_event
 from app.utils.env_check import validate_environment
 from app.utils.logging_config import configure_logging
 
@@ -32,18 +33,25 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     scheduler_task = asyncio.create_task(
         scheduler_loop(stop_event=stop_event), name="daily_agenda_scheduler"
     )
+    reminder_stop_event.clear()
+    reminder_task = asyncio.create_task(
+        reminder_scheduler_loop(stop_event=reminder_stop_event),
+        name="reminder_scheduler",
+    )
     try:
         yield
     finally:
         stop_event.set()
-        try:
-            await asyncio.wait_for(scheduler_task, timeout=10.0)
-        except asyncio.TimeoutError:
-            scheduler_task.cancel()
+        reminder_stop_event.set()
+        for task in (scheduler_task, reminder_task):
             try:
-                await scheduler_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+                await asyncio.wait_for(task, timeout=10.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
 
 
 app = FastAPI(title="WhatsApp Personal Assistant", lifespan=lifespan)

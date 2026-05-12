@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     daily_agenda_tick_seconds: int = 60
     daily_agenda_send_window_minutes: int = 5
 
+    # Reminder scheduler
+    reminder_tick_seconds: int = 15
+    reminder_max_attempts: int = 3
+    whatsapp_reminder_template_name: str = "reminder"
+
 
 @lru_cache
 def get_settings() -> Settings:

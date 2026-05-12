@@ -29,6 +29,7 @@ from app.services.pending_action import (
     clear_pending_action,
     set_pending_action,
 )
+from app.services.reminder import ReminderError, ReminderService
 from app.services.whatsapp import WhatsAppClient
 from app.utils.exceptions import AssistantError
 from app.utils.search import generate_tags
@@ -80,6 +81,7 @@ class ToolExecutor:
         whatsapp_client_factory=None,
         disambiguation_service_factory=None,
         memory_service_factory=None,
+        reminder_service_factory=None,
     ) -> None:
         self._google_auth_factory = google_auth_factory or (
             lambda session: GoogleAuthService(session)
@@ -95,6 +97,7 @@ class ToolExecutor:
             or (lambda client: DisambiguationService(client))
         )
         self._memory_service_factory = memory_service_factory or MemoryService
+        self._reminder_service_factory = reminder_service_factory or ReminderService
 
     async def execute(
         self,
@@ -116,6 +119,7 @@ class ToolExecutor:
             "memory_retrieve": self.handle_memory_retrieve,
             "memory_update": self.handle_memory_update,
             "memory_forget": self.handle_memory_forget,
+            "reminder_create": self.handle_reminder_create,
         }.get(tool_name)
 
         if handler is None:
@@ -618,6 +622,87 @@ class ToolExecutor:
 
         return await self._send_forget_confirmation(
             user=user, db=db, memory=matches[0]
+        )
+
+    async def handle_reminder_create(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        reminder_text = arguments.get("reminder_text")
+        remind_at_raw = arguments.get("remind_at")
+
+        if (
+            not isinstance(reminder_text, str)
+            or not reminder_text.strip()
+            or not isinstance(remind_at_raw, str)
+            or not remind_at_raw.strip()
+        ):
+            return ToolResult(
+                success=False,
+                message="What should I remind you about, and when?",
+                data={"tool": "reminder_create", "reason": "missing_args"},
+            )
+
+        try:
+            remind_at = parse_iso_datetime(remind_at_raw)
+        except InvalidDateTimeError:
+            return ToolResult(
+                success=False,
+                message="That time didn't look right — when should I remind you?",
+                data={"tool": "reminder_create", "reason": "invalid_datetime"},
+            )
+
+        if remind_at.tzinfo is None:
+            timezone = user.timezone or get_settings().default_timezone
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                remind_at = remind_at.replace(tzinfo=ZoneInfo(timezone))
+            except ZoneInfoNotFoundError:
+                remind_at = remind_at.replace(
+                    tzinfo=ZoneInfo(get_settings().default_timezone)
+                )
+
+        service = self._reminder_service_factory()
+        try:
+            reminder = await service.create_reminder(
+                user_id=user.id,
+                reminder_text=reminder_text.strip(),
+                remind_at=remind_at,
+                db=db,
+            )
+        except ReminderError as exc:
+            return ToolResult(
+                success=False,
+                message=exc.user_message,
+                data={"tool": "reminder_create", "reason": "rejected"},
+            )
+
+        timezone = user.timezone or get_settings().default_timezone
+        try:
+            formatted = format_event_time(
+                remind_at.isoformat(), remind_at.isoformat(), timezone
+            )
+            # format_event_time returns "Tue 13 May, 09:30-09:30" — keep
+            # only the day and start time for a reminder confirmation.
+            day_part, _, time_range = formatted.partition(",")
+            start_time = time_range.strip().split("-", 1)[0].strip()
+            display = f"{day_part.strip()} at {start_time}".strip()
+        except InvalidDateTimeError:
+            display = remind_at.isoformat()
+
+        return ToolResult(
+            success=True,
+            message=f"Reminder set for {display}.",
+            data={
+                "tool": "reminder_create",
+                "reminder_id": str(reminder.id),
+                "remind_at": remind_at.isoformat(),
+            },
         )
 
     async def _send_forget_confirmation(

@@ -213,6 +213,36 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "reminder_create",
+            "description": (
+                "Set a reminder for the user. The assistant will send a "
+                "WhatsApp message at the specified time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_text": {
+                        "type": "string",
+                        "description": "What to remind the user about.",
+                    },
+                    "remind_at": {
+                        "type": "string",
+                        "description": (
+                            "ISO 8601 datetime (with timezone) when the "
+                            "reminder should fire. Compute from current "
+                            "time + relative offset, or from absolute "
+                            "time given."
+                        ),
+                    },
+                },
+                "required": ["reminder_text", "remind_at"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_clarification",
             "description": "Ask the user a short question when critical information is missing.",
             "parameters": {
@@ -262,5 +292,6 @@ Rules:
 5. For memory: store facts concisely but completely. Generate 2-5 relevant tags.
 6. When user references previous message ("move IT", "cancel THAT"), use conversation context.
 7. Keep replies short and actionable. No fluff.
-8. Use reply tool for greetings, thank-yous, simple conversational responses."""
+8. Use reply tool for greetings, thank-yous, simple conversational responses.
+9. For reminders: when the user asks to be reminded at a specific time or after a delay, use the reminder_create tool. Compute the exact remind_at datetime from the current time above and the user's request, in the user's timezone. For relative times like "in 5 minutes", add exactly that duration to the current datetime. For "tomorrow at 9am", compute the next occurrence of 09:00 in the user's timezone. Always return remind_at as an ISO 8601 datetime with timezone offset."""
 

@@ -10,12 +10,12 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Settings: `app/config.py:get_settings()` — never read `os.environ` in app code
 - Async DB engine/session/base: `app/database.py`
 - Routers: `app/routers/{webhooks,oauth}.py`
-- Services: `app/services/{whatsapp,message_processor,planner,context,cost_tracker,llm_tools,google_auth,google_calendar,tool_executor,event_resolver,disambiguation,pending_action,memory,daily_agenda}.py`
+- Services: `app/services/{whatsapp,message_processor,planner,context,cost_tracker,llm_tools,google_auth,google_calendar,tool_executor,event_resolver,disambiguation,pending_action,memory,daily_agenda,reminder}.py`
 - Utils: `app/utils/{encryption,oauth_state,signature,timezone,generate_key,search,env_check,exceptions,retry,logging_config}.py`
 - ORM models in `app/models/`, all re-exported from `app/models/__init__.py` so Alembic autogenerate sees them
-- Migrations: `alembic/versions/0001_initial_schema.py`, `0002_daily_api_usage.py`, `0003_daily_agenda_sends.py`
+- Migrations: `alembic/versions/0001_initial_schema.py`, `0002_daily_api_usage.py`, `0003_daily_agenda_sends.py`, `0004_reminders.py`
 - Tests: `tests/`, configured in `tests/conftest.py`
-- `app/main.py` lifespan starts `daily_agenda.scheduler_loop` as a background asyncio task; shutdown sets a stop event and joins (10s timeout, then cancel).
+- `app/main.py` lifespan starts both `daily_agenda.scheduler_loop` and `reminder.reminder_scheduler_loop` as background asyncio tasks; shutdown sets stop events and joins (10s timeout per task, then cancel).
 
 ## Rules & Patterns
 
@@ -89,10 +89,18 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Ops scripts in `scripts/`: `backup.sh` (pg_dump → gzip → rclone B2, prune local >7d), `restore.sh` (drops + recreates DB, restores, verifies /health), `dev-tunnel.sh` (Cloudflare Tunnel), `vps-setup.sh` (one-time Ubuntu bootstrap: Docker, UFW 22/80/443, rclone, `/opt/whatsapp-assistant`).
 - Backups: rclone remote named `b2`, bucket from `$B2_BUCKET`, daily 3 AM cron. Step-by-step prod runbook in `DEPLOYMENT.md`.
 
+## Reminder Scheduler
+
+- One-shot reminders persisted in `reminders` (`remind_at`, `sent`, `sent_at`, `failed_attempts`). Partial index `ix_reminders_due` covers `WHERE sent = false` for the tick query.
+- `ReminderScheduler.run_tick` loads up to 50 due unsent rows (`get_due_reminders`), sends each one, commits. Per-reminder errors are isolated. `reminder_scheduler_loop` ticks every `REMINDER_TICK_SECONDS` (default 15s).
+- Send strategy: try `WhatsAppClient.send_text_message` first; on `WhatsAppAPIError` whose body contains `131026` (outside 24h window) fall back to `send_template_message` with template `WHATSAPP_REMINDER_TEMPLATE_NAME` (default `reminder`, single `{{1}}` body param, language `WHATSAPP_TEMPLATE_LANGUAGE`).
+- After `REMINDER_MAX_ATTEMPTS` (default 3) failed sends the reminder is force-marked `sent=True` to avoid infinite retry. Non-24h send errors increment `failed_attempts` but do not retry within the same tick.
+- `reminder_create` planner tool: `(reminder_text, remind_at)`. The planner computes `remind_at` from injected current datetime + user timezone. Handler rejects naive datetimes, past times (30s grace), and times >365 days out via `ReminderError` (subclass of `AssistantError`).
+
 ## Current State
 
-- 279 unit tests pass with `python -m pytest -q`.
-- All planner tools implemented: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`, `memory_store`, `memory_retrieve`, `memory_update`, `memory_forget`.
+- 301 unit tests pass with `python -m pytest -q`.
+- All planner tools implemented: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`, `memory_store`, `memory_retrieve`, `memory_update`, `memory_forget`, `reminder_create`.
 - Daily-agenda scheduler runs in-process from the lifespan; sends are gated by the `daily_agenda_sends` unique constraint.
 - Interactive webhook replies (button_reply, list_reply) are parsed and routed through the disambiguation resume flow.
 - Google OAuth flow wired end-to-end (`/authorize` → consent → `/callback` → encrypted token storage).
