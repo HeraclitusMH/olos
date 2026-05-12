@@ -1,7 +1,16 @@
-yourdomain.com {
+invisiblelandscapes.art {
     request_body {
         max_size 10MB
     }
 
-    reverse_proxy api:8000
+    handle /privacy {
+                   respond "Privacy Policy: This app is for personal use only. No user data is collected, stored, or shared with third parties." 200
+
+
+    }
+
+    handle {
+        reverse_proxy api:8000
+    }
 }
+

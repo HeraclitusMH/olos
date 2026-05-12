@@ -1,0 +1,49 @@
+# Production overrides. Apply on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Notes:
+# - The `api` service is NOT published to the host. Caddy terminates TLS on 80/443
+#   and reverse-proxies to api:8000 over the internal compose network.
+# - The `db` service has no port mapping in either compose file, so it stays
+#   internal in dev and prod alike.
+services:
+  api:
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    restart: always
+    shm_size: 128mb
+    # No `ports:` block here on purpose — db must stay internal in production.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U assistant"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
