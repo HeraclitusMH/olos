@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Security
     encryption_key: str
 
+    # WhatsApp template for proactive (outbound) messages like the daily agenda.
+    # Create and get this approved in Meta Business Manager first.
+    whatsapp_template_name: str = "daily_agenda"
+    whatsapp_template_language: str = "en"
+
     # App settings
     daily_api_limit: int = 100
     default_timezone: str = "Europe/Madrid"

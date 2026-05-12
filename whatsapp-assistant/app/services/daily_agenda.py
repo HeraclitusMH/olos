@@ -318,9 +318,13 @@ class DailyAgendaService:
                 return False
 
             message = format_agenda_message(events, local_today, prefs.timezone)
+            settings = get_settings()
             try:
-                await self._whatsapp_client_factory().send_text_message(
-                    to=user.wa_id, text=message
+                await self._whatsapp_client_factory().send_template_message(
+                    to=user.wa_id,
+                    template_name=settings.whatsapp_template_name,
+                    body_text=message,
+                    language_code=settings.whatsapp_template_language,
                 )
             except WhatsAppSendError:
                 logger.exception(

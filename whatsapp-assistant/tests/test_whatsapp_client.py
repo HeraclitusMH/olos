@@ -89,6 +89,34 @@ async def test_send_interactive_buttons_payload_shape() -> None:
     assert interactive["action"]["buttons"] == buttons
 
 
+async def test_send_template_message_payload_shape() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"messages": [{"id": "x"}]})
+
+    transport = httpx.MockTransport(handler)
+    client = _client_with_transport(transport)
+
+    await client.send_template_message(
+        "34600111222", "daily_agenda", "Good morning! You have no events today.", "en_US"
+    )
+
+    body = captured["body"]
+    assert body["type"] == "template"
+    assert body["to"] == "34600111222"
+    tmpl = body["template"]
+    assert tmpl["name"] == "daily_agenda"
+    assert tmpl["language"] == {"code": "en_US"}
+    components = tmpl["components"]
+    assert len(components) == 1
+    assert components[0]["type"] == "body"
+    assert components[0]["parameters"] == [
+        {"type": "text", "text": "Good morning! You have no events today."}
+    ]
+
+
 async def test_send_interactive_list_payload_shape() -> None:
     captured: dict = {}
 

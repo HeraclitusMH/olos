@@ -112,6 +112,37 @@ class WhatsAppClient:
         }
         return await self._post(payload)
 
+    async def send_template_message(
+        self,
+        to: str,
+        template_name: str,
+        body_text: str,
+        language_code: str = "en",
+    ) -> dict[str, Any]:
+        """Send a pre-approved WhatsApp template message.
+
+        Use this for proactive outbound messages (e.g. daily agenda) where the
+        24-hour customer-service window may have expired. The template must be
+        approved in Meta Business Manager before use. ``body_text`` is passed
+        as the first body component parameter (``{{1}}`` in the template body).
+        """
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [{"type": "text", "text": body_text}],
+                    }
+                ],
+            },
+        }
+        return await self._post(payload)
+
     async def send_interactive_buttons(
         self, to: str, body_text: str, buttons: list[dict[str, Any]]
     ) -> dict[str, Any]:

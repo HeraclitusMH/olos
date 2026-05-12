@@ -66,6 +66,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Revoked Google account (`TokenExpiredError`) or transient `GoogleAuthError` → skip the user silently for this tick, do not spam them.
 - Bad `timezone` / `time_local` fall back to defaults and log a warning (no secrets).
 - Agenda message header built explicitly (no `%-d` — non-portable on Windows). Time range uses an en-dash (`09:30–10:15`).
+- Daily agenda sends use `WhatsAppClient.send_template_message` (not `send_text_message`) because proactive outbound messages outside the 24-hour customer-service window require a pre-approved template or the API returns error 131026. Template name/language configured via `WHATSAPP_TEMPLATE_NAME` / `WHATSAPP_TEMPLATE_LANGUAGE` (Settings defaults: `daily_agenda` / `en`). The template must have a single `{{1}}` body parameter. Create and approve it in Meta Business Manager before enabling the scheduler.
 
 ## Error Handling & Hardening
 
@@ -90,7 +91,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 
 ## Current State
 
-- 283 unit tests pass with `python -m pytest -q`.
+- 279 unit tests pass with `python -m pytest -q`.
 - All planner tools implemented: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`, `memory_store`, `memory_retrieve`, `memory_update`, `memory_forget`.
 - Daily-agenda scheduler runs in-process from the lifespan; sends are gated by the `daily_agenda_sends` unique constraint.
 - Interactive webhook replies (button_reply, list_reply) are parsed and routed through the disambiguation resume flow.

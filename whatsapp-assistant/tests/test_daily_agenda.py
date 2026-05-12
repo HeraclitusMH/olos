@@ -184,9 +184,23 @@ class _FakeCalendar:
 class _FakeWhatsApp:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.template_calls: list[dict[str, str]] = []
 
     async def send_text_message(self, to: str, text: str) -> dict[str, Any]:
         self.sent.append((to, text))
+        return {"ok": True}
+
+    async def send_template_message(
+        self,
+        to: str,
+        template_name: str,
+        body_text: str,
+        language_code: str = "en",
+    ) -> dict[str, Any]:
+        self.sent.append((to, body_text))
+        self.template_calls.append(
+            {"to": to, "template_name": template_name, "language_code": language_code}
+        )
         return {"ok": True}
 
 
@@ -496,3 +510,38 @@ async def test_run_tick_skips_user_with_no_google_account() -> None:
 
     assert sent == 0
     assert whatsapp.sent == []
+
+
+@pytest.mark.asyncio
+async def test_run_tick_uses_template_message_with_configured_name() -> None:
+    """Agenda sends must use send_template_message, not send_text_message."""
+    import os
+
+    from app.config import get_settings
+
+    user = _make_user()
+    account = _make_account(user.id)
+    load_session = _FakeSession(users=[user])
+    process_session = _FakeSession(account=account, already_sent=False)
+
+    calendar = _FakeCalendar(events=[])
+    whatsapp = _FakeWhatsApp()
+    service = _build_service([load_session, process_session], calendar, whatsapp)
+
+    os.environ["WHATSAPP_TEMPLATE_NAME"] = "my_agenda_template"
+    os.environ["WHATSAPP_TEMPLATE_LANGUAGE"] = "en_US"
+    get_settings.cache_clear()
+
+    try:
+        sent = await service.run_tick(now_utc=_due_now_utc())
+    finally:
+        del os.environ["WHATSAPP_TEMPLATE_NAME"]
+        del os.environ["WHATSAPP_TEMPLATE_LANGUAGE"]
+        get_settings.cache_clear()
+
+    assert sent == 1
+    assert len(whatsapp.template_calls) == 1
+    call = whatsapp.template_calls[0]
+    assert call["to"] == user.wa_id
+    assert call["template_name"] == "my_agenda_template"
+    assert call["language_code"] == "en_US"
