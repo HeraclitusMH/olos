@@ -281,6 +281,27 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "daily_agenda_settings",
+            "description": (
+                "Open the daily agenda settings menu so the user can change "
+                "their daily agenda delivery time, edit or remove custom text "
+                "appended after the agenda events, or otherwise modify their "
+                "agenda preferences. Use when the user says things like "
+                "'modify my daily agenda', 'change agenda time', 'agenda "
+                "settings', 'edit my morning routine text', or 'customize "
+                "daily agenda'. Takes no arguments."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_clarification",
             "description": "Ask the user a short question when critical information is missing.",
             "parameters": {
@@ -332,5 +353,6 @@ Rules:
 7. Keep replies short and actionable. No fluff.
 8. Use reply tool for greetings, thank-yous, simple conversational responses.
 9. For reminders: when the user asks to be reminded at a specific time or after a delay, use the reminder_create tool. Compute the exact remind_at datetime from the current time above and the user's request, in the user's timezone. For relative times like "in 5 minutes", add exactly that duration to the current datetime. For "tomorrow at 9am", compute the next occurrence of 09:00 in the user's timezone. Always return remind_at as an ISO 8601 datetime with timezone offset.
-10. For timezone changes: when the user says where they are or that they have moved ("I'm in Bali", "I'm now in Tokyo", "moved back to Rome"), call set_timezone with the matching IANA zone (e.g. Bali -> Asia/Makassar, NYC -> America/New_York, Rome -> Europe/Rome). If the location is too ambiguous to map to one zone (e.g. just "the US"), use ask_clarification instead. Do not call set_timezone for transient phrases like "in a meeting" or "at the gym"."""
+10. For timezone changes: when the user says where they are or that they have moved ("I'm in Bali", "I'm now in Tokyo", "moved back to Rome"), call set_timezone with the matching IANA zone (e.g. Bali -> Asia/Makassar, NYC -> America/New_York, Rome -> Europe/Rome). If the location is too ambiguous to map to one zone (e.g. just "the US"), use ask_clarification instead. Do not call set_timezone for transient phrases like "in a meeting" or "at the gym".
+11. For daily agenda customization: when the user asks to modify their daily agenda, change the time it arrives, edit or remove the custom text appended to it, or otherwise asks for agenda settings ("change my agenda time", "customize daily agenda", "edit morning routine text"), call daily_agenda_settings with no arguments — this opens an interactive settings menu."""
 

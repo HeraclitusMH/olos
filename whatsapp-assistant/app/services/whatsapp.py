@@ -183,3 +183,83 @@ class WhatsAppClient:
             },
         }
         return await self._post(payload)
+
+    async def send_list_message(
+        self,
+        to: str,
+        body: str,
+        button_text: str,
+        sections: list[dict[str, Any]],
+        header: str | None = None,
+        footer: str | None = None,
+    ) -> dict[str, Any]:
+        """Send an interactive list message with optional header / footer.
+
+        Enforces WhatsApp Cloud API limits:
+            - ``button_text`` max 20 chars
+            - section titles max 24 chars, row titles max 24, descriptions max 72
+            - max 10 rows total across all sections
+            - body max 4096, header max 60, footer max 60
+        """
+        if not button_text or len(button_text) > 20:
+            raise ValueError("button_text must be 1-20 characters")
+        if len(body) > 4096:
+            raise ValueError("body must be <= 4096 characters")
+        if header is not None and len(header) > 60:
+            raise ValueError("header must be <= 60 characters")
+        if footer is not None and len(footer) > 60:
+            raise ValueError("footer must be <= 60 characters")
+
+        total_rows = 0
+        validated_sections: list[dict[str, Any]] = []
+        for section in sections:
+            section_title = section.get("title")
+            if isinstance(section_title, str) and len(section_title) > 24:
+                raise ValueError("section title must be <= 24 characters")
+            raw_rows = section.get("rows") or []
+            validated_rows: list[dict[str, Any]] = []
+            for row in raw_rows:
+                row_id = row.get("id")
+                row_title = row.get("title")
+                if not isinstance(row_id, str) or not row_id:
+                    raise ValueError("row id is required")
+                if not isinstance(row_title, str) or not row_title:
+                    raise ValueError("row title is required")
+                if len(row_title) > 24:
+                    raise ValueError("row title must be <= 24 characters")
+                row_payload: dict[str, Any] = {"id": row_id, "title": row_title}
+                description = row.get("description")
+                if isinstance(description, str) and description:
+                    if len(description) > 72:
+                        raise ValueError(
+                            "row description must be <= 72 characters"
+                        )
+                    row_payload["description"] = description
+                validated_rows.append(row_payload)
+                total_rows += 1
+            section_payload: dict[str, Any] = {"rows": validated_rows}
+            if isinstance(section_title, str) and section_title:
+                section_payload["title"] = section_title
+            validated_sections.append(section_payload)
+        if total_rows > 10:
+            raise ValueError("list messages support at most 10 rows in total")
+        if total_rows == 0:
+            raise ValueError("list message must include at least one row")
+
+        interactive: dict[str, Any] = {
+            "type": "list",
+            "body": {"text": body},
+            "action": {"button": button_text, "sections": validated_sections},
+        }
+        if header is not None:
+            interactive["header"] = {"type": "text", "text": header}
+        if footer is not None:
+            interactive["footer"] = {"text": footer}
+
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "interactive",
+            "interactive": interactive,
+        }
+        return await self._post(payload)

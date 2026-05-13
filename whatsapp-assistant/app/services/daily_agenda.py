@@ -54,12 +54,44 @@ _ADVISORY_LOCK_KEY = 0x6461696C795F6167  # "daily_ag" — fits in int64.
 
 _PREFS_KEY = "daily_agenda"
 
+AGENDA_CUSTOM_TEXT_MAX_LENGTH = 500
+
+# Five contiguous ranges of half-hour slots covering the 24-hour day. Used by
+# the WhatsApp settings flow to pick a delivery time in two list-message steps
+# (WhatsApp lists max out at 10 rows, and we have 48 half-hour slots).
+TIME_RANGES: list[tuple[str, str, str]] = [
+    ("00:00", "04:30", "Night / Early morning"),
+    ("05:00", "09:30", "Morning"),
+    ("10:00", "14:30", "Late morning / Afternoon"),
+    ("15:00", "19:30", "Afternoon / Evening"),
+    ("20:00", "23:30", "Night"),
+]
+
+_TIME_SLOT_STARTS: list[int] = [0, 10, 20, 30, 40]
+_TIME_SLOT_COUNTS: list[int] = [10, 10, 10, 10, 8]
+
+
+def generate_time_slots(range_index: int) -> list[dict[str, str]]:
+    """Half-hour slots for ``range_index`` (0-4) as list-message row payloads."""
+    if range_index < 0 or range_index >= len(_TIME_SLOT_STARTS):
+        raise ValueError(f"range_index out of range: {range_index}")
+    base = _TIME_SLOT_STARTS[range_index]
+    count = _TIME_SLOT_COUNTS[range_index]
+    slots: list[dict[str, str]] = []
+    for offset in range(count):
+        total_minutes = (base + offset) * 30
+        hour, minute = divmod(total_minutes, 60)
+        time_str = f"{hour:02d}:{minute:02d}"
+        slots.append({"id": f"agenda_time:{time_str}", "title": time_str})
+    return slots
+
 
 @dataclass(frozen=True)
 class AgendaPrefs:
     enabled: bool
     timezone: str
     time_local: str  # "HH:MM"
+    custom_footer_text: str | None = None
 
 
 def _default_prefs() -> AgendaPrefs:
@@ -68,6 +100,7 @@ def _default_prefs() -> AgendaPrefs:
         enabled=True,
         timezone=settings.daily_agenda_default_timezone,
         time_local=settings.daily_agenda_default_time_local,
+        custom_footer_text=None,
     )
 
 
@@ -89,7 +122,20 @@ def get_user_prefs(user: User) -> AgendaPrefs:
     time_local = (
         time_raw if isinstance(time_raw, str) and time_raw else defaults.time_local
     )
-    return AgendaPrefs(enabled=enabled, timezone=timezone, time_local=time_local)
+
+    footer_raw = prefs.get("custom_footer_text")
+    custom_footer_text = (
+        footer_raw.strip()
+        if isinstance(footer_raw, str) and footer_raw.strip()
+        else None
+    )
+
+    return AgendaPrefs(
+        enabled=enabled,
+        timezone=timezone,
+        time_local=time_local,
+        custom_footer_text=custom_footer_text,
+    )
 
 
 def _resolve_zone(tz_name: str) -> tuple[ZoneInfo, str]:
@@ -173,9 +219,15 @@ def format_agenda_message(
     events: list[dict[str, Any]],
     local_date: date,
     timezone: str,
+    custom_footer_text: str | None = None,
 ) -> str:
+    custom = (custom_footer_text or "").strip()
     if not events:
-        return "Good morning! You have no events today."
+        base = "Good morning! You have no events today."
+        if custom:
+            return f"{base}\n\n---\n\n{custom}"
+        return base
+
     # Built explicitly to avoid ``%-d`` (non-portable on Windows).
     header_day = (
         f"{local_date.strftime('%a')}, {local_date.day} "
@@ -184,7 +236,10 @@ def format_agenda_message(
     lines = [f"Good morning! Here are your events for {header_day} (your time):"]
     for event in events:
         lines.append(_format_event_line(event, timezone))
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    if custom:
+        return f"{body}\n\n---\n\n{custom}"
+    return body
 
 
 # Type alias for clarity in dependency injection.
@@ -317,7 +372,12 @@ class DailyAgendaService:
             if events is None:
                 return False
 
-            message = format_agenda_message(events, local_today, prefs.timezone)
+            message = format_agenda_message(
+                events,
+                local_today,
+                prefs.timezone,
+                custom_footer_text=prefs.custom_footer_text,
+            )
             settings = get_settings()
             try:
                 await self._whatsapp_client_factory().send_template_message(
@@ -487,11 +547,14 @@ async def scheduler_loop(
 def set_user_prefs(user: User, prefs: AgendaPrefs) -> None:
     """Reassign ``user.preferences_json`` with the given daily-agenda prefs."""
     current = dict(user.preferences_json or {})
-    current[_PREFS_KEY] = {
+    payload: dict[str, Any] = {
         "enabled": prefs.enabled,
         "timezone": prefs.timezone,
         "time_local": prefs.time_local,
     }
+    if prefs.custom_footer_text:
+        payload["custom_footer_text"] = prefs.custom_footer_text
+    current[_PREFS_KEY] = payload
     user.preferences_json = current
 
 

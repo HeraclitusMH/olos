@@ -26,6 +26,7 @@ class _DummyUser:
         self.id = uuid.uuid4()
         self.wa_id = "34600111222"
         self.timezone = "Europe/Madrid"
+        self.preferences_json: dict[str, Any] = {}
 
 
 class _CountingCostTracker:

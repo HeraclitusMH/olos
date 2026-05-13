@@ -12,6 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models import EventReference, GoogleAccount, Memory, Message, User
+from app.services.daily_agenda import (
+    TIME_RANGES,
+    generate_time_slots,
+    get_user_prefs,
+)
 from app.services.disambiguation import (
     DisambiguationService,
     build_option_id,
@@ -121,6 +126,7 @@ class ToolExecutor:
             "memory_forget": self.handle_memory_forget,
             "reminder_create": self.handle_reminder_create,
             "set_timezone": self.handle_set_timezone,
+            "daily_agenda_settings": self.handle_daily_agenda_settings,
         }.get(tool_name)
 
         if handler is None:
@@ -777,6 +783,132 @@ class ToolExecutor:
                 "previous_timezone": previous,
             },
         )
+
+    async def handle_daily_agenda_settings(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        prefs = get_user_prefs(user)
+        custom_status = (
+            "✓ Set" if prefs.custom_footer_text else "None"
+        )
+        body_text = (
+            "📋 Daily Agenda Settings\n\n"
+            f"Current time: {prefs.time_local}\n"
+            f"Custom text: {custom_status}\n\n"
+            "What would you like to change?"
+        )
+        buttons = [
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "agenda_settings:change_time",
+                    "title": "Change time",
+                },
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "agenda_settings:edit_text",
+                    "title": "Edit text",
+                },
+            },
+            {
+                "type": "reply",
+                "reply": {
+                    "id": "agenda_settings:remove_text",
+                    "title": "Remove text",
+                },
+            },
+        ]
+        client = self._whatsapp_client_factory()
+        try:
+            await client.send_interactive_buttons(
+                to=user.wa_id, body_text=body_text, buttons=buttons
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send agenda settings menu for user=%s", user.id
+            )
+            return ToolResult(
+                success=False,
+                message="I couldn't open the settings menu. Try again.",
+                data={
+                    "tool": "daily_agenda_settings",
+                    "reason": "menu_send_failed",
+                },
+            )
+
+        set_pending_action(
+            user,
+            disambiguation_id="agenda_settings",
+            action_type="agenda_settings",
+            arguments={},
+            options=[],
+            extra={
+                "current_time_local": prefs.time_local,
+                "current_timezone": prefs.timezone,
+                "has_custom_text": prefs.custom_footer_text is not None,
+            },
+        )
+        await db.flush()
+
+        return ToolResult(
+            success=True,
+            message="",
+            data={
+                "tool": "daily_agenda_settings",
+                "reason": "menu_sent",
+                "sent_directly": True,
+            },
+        )
+
+    async def send_agenda_time_ranges(self, user: User) -> bool:
+        """Send the WhatsApp list message asking for a half-day time range."""
+        rows = [
+            {
+                "id": f"agenda_range:{idx}",
+                "title": f"{start} – {end}",
+                "description": label,
+            }
+            for idx, (start, end, label) in enumerate(TIME_RANGES)
+        ]
+        client = self._whatsapp_client_factory()
+        try:
+            await client.send_list_message(
+                to=user.wa_id,
+                body="Pick a time range:",
+                button_text="Select range",
+                sections=[{"title": "Time ranges", "rows": rows}],
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send agenda time range list for user=%s", user.id
+            )
+            return False
+        return True
+
+    async def send_agenda_time_slots(self, user: User, range_index: int) -> bool:
+        """Send the WhatsApp list message with the half-hour slots for a range."""
+        rows = generate_time_slots(range_index)
+        client = self._whatsapp_client_factory()
+        try:
+            await client.send_list_message(
+                to=user.wa_id,
+                body="Pick your preferred time:",
+                button_text="Select time",
+                sections=[{"title": "Times", "rows": rows}],
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send agenda time slot list for user=%s", user.id
+            )
+            return False
+        return True
 
     async def _send_forget_confirmation(
         self, *, user: User, db: AsyncSession, memory: Memory

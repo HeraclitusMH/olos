@@ -19,6 +19,7 @@ from app.database import AsyncSessionLocal
 from app.models import Message, User
 from app.services.context import build_conversation_context
 from app.services.cost_tracker import CostTracker
+from app.services.daily_agenda import AGENDA_CUSTOM_TEXT_MAX_LENGTH, TIME_RANGES
 from app.services.disambiguation import parse_option_id
 from app.services.google_auth import GoogleAuthError, build_authorization_url
 from app.services.memory import MemoryService
@@ -26,6 +27,7 @@ from app.services.pending_action import (
     clear_pending_action,
     deserialize_event,
     get_active_pending_action,
+    set_pending_action,
 )
 from app.services.planner import Planner
 from app.services.tool_executor import (
@@ -405,6 +407,9 @@ async def _finalize_failure(
         )
 
 
+_AGENDA_CANCEL_KEYWORDS = {"cancel", "skip", "nevermind", "never mind", "stop"}
+
+
 async def _process_text_message(
     *,
     inbound: InboundMessage,
@@ -416,6 +421,12 @@ async def _process_text_message(
     planner: Planner,
     tool_executor: ToolExecutor,
 ) -> ToolExecutionLog:
+    pending_text_log = await _try_consume_agenda_custom_text(
+        user, session, inbound.text
+    )
+    if pending_text_log is not None:
+        return pending_text_log
+
     conversation_history = await build_conversation_context(
         user.id, session, limit=10
     )
@@ -460,6 +471,16 @@ async def _process_interactive_reply(
             user=user,
             session=session,
             memory_service=memory_service,
+        )
+
+    if interactive_id.startswith(
+        ("agenda_settings:", "agenda_range:", "agenda_time:")
+    ):
+        return await _process_agenda_settings_reply(
+            interactive_id=interactive_id,
+            user=user,
+            session=session,
+            tool_executor=tool_executor,
         )
 
     parsed = parse_option_id(interactive_id)
@@ -791,6 +812,314 @@ async def _process_forget_confirmation(
             "tool": "memory_forget",
             "success": True,
             "data": {"action": "forgotten", "memory_id": str(memory.id)},
+        }
+    )
+    return log
+
+
+_AGENDA_PENDING_TYPES = {
+    "agenda_settings",
+    "agenda_time_range",
+    "agenda_time_select",
+    "agenda_custom_text",
+}
+
+
+def _expired_agenda_reply() -> ToolExecutionLog:
+    log = ToolExecutionLog()
+    log.replies.append(
+        "This settings session has expired. Say 'agenda settings' to start again."
+    )
+    log.results.append(
+        {
+            "tool": "daily_agenda_settings",
+            "success": False,
+            "data": {"reason": "expired_or_missing"},
+        }
+    )
+    return log
+
+
+def _set_agenda_pending(user: User, *, action_type: str) -> None:
+    set_pending_action(
+        user,
+        disambiguation_id="agenda_settings",
+        action_type=action_type,
+        arguments={},
+        options=[],
+    )
+
+
+def _update_daily_agenda_pref(user: User, key: str, value: Any) -> None:
+    """JSONB-safe assignment under ``preferences_json['daily_agenda'][key]``."""
+    prefs = dict(user.preferences_json or {})
+    daily_agenda = dict(prefs.get("daily_agenda") or {})
+    daily_agenda[key] = value
+    prefs["daily_agenda"] = daily_agenda
+    user.preferences_json = prefs
+
+
+def _remove_daily_agenda_pref(user: User, key: str) -> bool:
+    """Remove ``preferences_json['daily_agenda'][key]``. Returns True if removed."""
+    prefs = dict(user.preferences_json or {})
+    daily_agenda = dict(prefs.get("daily_agenda") or {})
+    if key not in daily_agenda:
+        return False
+    daily_agenda.pop(key, None)
+    prefs["daily_agenda"] = daily_agenda
+    user.preferences_json = prefs
+    return True
+
+
+def _is_valid_agenda_time(value: str) -> bool:
+    if len(value) != 5 or value[2] != ":":
+        return False
+    try:
+        hour = int(value[:2])
+        minute = int(value[3:])
+    except ValueError:
+        return False
+    if not 0 <= hour <= 23:
+        return False
+    return minute in (0, 30)
+
+
+async def _process_agenda_settings_reply(
+    *,
+    interactive_id: str,
+    user: User,
+    session: AsyncSession,
+    tool_executor: ToolExecutor,
+) -> ToolExecutionLog:
+    log = ToolExecutionLog()
+    pending = get_active_pending_action(user)
+    pending_type = pending.get("type") if isinstance(pending, dict) else None
+    if pending_type not in _AGENDA_PENDING_TYPES:
+        clear_pending_action(user)
+        return _expired_agenda_reply()
+
+    if interactive_id == "agenda_settings:change_time":
+        sent = await tool_executor.send_agenda_time_ranges(user)
+        if not sent:
+            clear_pending_action(user)
+            log.replies.append("Couldn't open the time picker. Try again.")
+            log.results.append(
+                {
+                    "tool": "daily_agenda_settings",
+                    "success": False,
+                    "data": {"reason": "send_failed"},
+                }
+            )
+            return log
+        _set_agenda_pending(user, action_type="agenda_time_range")
+        await session.flush()
+        log.sent_directly = True
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": True,
+                "data": {"step": "time_range_sent", "sent_directly": True},
+            }
+        )
+        return log
+
+    if interactive_id == "agenda_settings:edit_text":
+        existing = ((user.preferences_json or {}).get("daily_agenda") or {}).get(
+            "custom_footer_text"
+        )
+        prompt = (
+            "Send me the custom text you'd like to appear after your daily "
+            f"events.\n\nMax {AGENDA_CUSTOM_TEXT_MAX_LENGTH} characters. "
+            "You can include your morning routine, affirmations, reminders, "
+            "etc. Reply 'cancel' to abort."
+        )
+        if isinstance(existing, str) and existing.strip():
+            prompt += f"\n\nCurrent text:\n{existing}"
+        _set_agenda_pending(user, action_type="agenda_custom_text")
+        await session.flush()
+        log.replies.append(prompt)
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": True,
+                "data": {"step": "awaiting_custom_text"},
+            }
+        )
+        return log
+
+    if interactive_id == "agenda_settings:remove_text":
+        removed = _remove_daily_agenda_pref(user, "custom_footer_text")
+        clear_pending_action(user)
+        await session.flush()
+        if removed:
+            log.replies.append("✓ Custom text removed from your daily agenda.")
+        else:
+            log.replies.append("No custom text was set. Nothing to remove.")
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": True,
+                "data": {"step": "remove_text", "removed": removed},
+            }
+        )
+        return log
+
+    if interactive_id.startswith("agenda_range:"):
+        if pending_type not in {"agenda_time_range", "agenda_settings"}:
+            return _expired_agenda_reply()
+        suffix = interactive_id[len("agenda_range:"):]
+        try:
+            range_index = int(suffix)
+        except ValueError:
+            clear_pending_action(user)
+            log.replies.append("That selection is no longer valid.")
+            log.results.append(
+                {
+                    "tool": "daily_agenda_settings",
+                    "success": False,
+                    "data": {"reason": "invalid_range"},
+                }
+            )
+            return log
+        if not 0 <= range_index < len(TIME_RANGES):
+            clear_pending_action(user)
+            log.replies.append("That selection is no longer valid.")
+            log.results.append(
+                {
+                    "tool": "daily_agenda_settings",
+                    "success": False,
+                    "data": {"reason": "invalid_range"},
+                }
+            )
+            return log
+        sent = await tool_executor.send_agenda_time_slots(user, range_index)
+        if not sent:
+            clear_pending_action(user)
+            log.replies.append("Couldn't show the time options. Try again.")
+            log.results.append(
+                {
+                    "tool": "daily_agenda_settings",
+                    "success": False,
+                    "data": {"reason": "send_failed"},
+                }
+            )
+            return log
+        _set_agenda_pending(user, action_type="agenda_time_select")
+        await session.flush()
+        log.sent_directly = True
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": True,
+                "data": {
+                    "step": "time_slots_sent",
+                    "range_index": range_index,
+                    "sent_directly": True,
+                },
+            }
+        )
+        return log
+
+    if interactive_id.startswith("agenda_time:"):
+        if pending_type not in {"agenda_time_select", "agenda_settings"}:
+            return _expired_agenda_reply()
+        time_value = interactive_id[len("agenda_time:"):]
+        if not _is_valid_agenda_time(time_value):
+            clear_pending_action(user)
+            log.replies.append("That time is not valid.")
+            log.results.append(
+                {
+                    "tool": "daily_agenda_settings",
+                    "success": False,
+                    "data": {"reason": "invalid_time"},
+                }
+            )
+            return log
+        _update_daily_agenda_pref(user, "time_local", time_value)
+        _update_daily_agenda_pref(user, "enabled", True)
+        clear_pending_action(user)
+        await session.flush()
+        log.replies.append(
+            f"✓ Daily agenda will now be sent at {time_value} every day."
+        )
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": True,
+                "data": {"step": "time_saved", "time_local": time_value},
+            }
+        )
+        return log
+
+    clear_pending_action(user)
+    return _expired_agenda_reply()
+
+
+async def _try_consume_agenda_custom_text(
+    user: User, session: AsyncSession, text: str
+) -> ToolExecutionLog | None:
+    """If a custom-text capture is pending, consume ``text`` and return a log.
+
+    Returns ``None`` if no capture is pending, so the planner runs as usual.
+    """
+    pending = get_active_pending_action(user)
+    if not isinstance(pending, dict) or pending.get("type") != "agenda_custom_text":
+        return None
+
+    log = ToolExecutionLog()
+    stripped = (text or "").strip()
+    if stripped.lower() in _AGENDA_CANCEL_KEYWORDS:
+        clear_pending_action(user)
+        await session.flush()
+        log.replies.append("Cancelled. Custom text not changed.")
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": True,
+                "data": {"step": "custom_text_cancelled"},
+            }
+        )
+        return log
+
+    if not stripped:
+        log.replies.append(
+            "Text cannot be empty. Send your custom text or say 'cancel' to abort."
+        )
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": False,
+                "data": {"reason": "empty_text"},
+            }
+        )
+        return log
+
+    if len(stripped) > AGENDA_CUSTOM_TEXT_MAX_LENGTH:
+        log.replies.append(
+            f"That's too long ({len(stripped)} chars). "
+            f"Keep it under {AGENDA_CUSTOM_TEXT_MAX_LENGTH} characters, "
+            "or say 'cancel' to abort."
+        )
+        log.results.append(
+            {
+                "tool": "daily_agenda_settings",
+                "success": False,
+                "data": {"reason": "too_long", "length": len(stripped)},
+            }
+        )
+        return log
+
+    _update_daily_agenda_pref(user, "custom_footer_text", stripped)
+    clear_pending_action(user)
+    await session.flush()
+    log.replies.append(
+        "✓ Custom text saved. It will appear in your daily agenda below your events."
+    )
+    log.results.append(
+        {
+            "tool": "daily_agenda_settings",
+            "success": True,
+            "data": {"step": "custom_text_saved"},
         }
     )
     return log

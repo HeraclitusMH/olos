@@ -40,7 +40,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - `app/main.py` calls `validate_environment()` (`app/utils/env_check.py`) at module import, after `configure_logging()` and before the FastAPI app is constructed. Missing/malformed required vars raise `SystemExit`. Tests rely on `tests/conftest.py:_TEST_ENV` being set before `app.main` is imported.
 - Caddy terminates TLS; `api` container is not exposed on the host. Dockerfile installs `curl` because the prod healthcheck shells out to it.
 - JSONB columns (`preferences_json`, etc.) require full reassignment to trigger SQLAlchemy dirty tracking — never mutate in place.
-- WhatsApp interactive messages: max 3 buttons (use list for 4+), button titles max 20 chars.
+- WhatsApp interactive messages: max 3 buttons (use list for 4+), button titles max 20 chars. `WhatsAppClient.send_list_message` enforces all Cloud-API limits (button ≤20, section title ≤24, row title ≤24, row description ≤72, ≤10 rows total, body ≤4096, header/footer ≤60) and raises `ValueError` before posting.
 
 ## Disambiguation & Pending Actions
 
@@ -50,6 +50,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - Memory forget confirmation uses button ids `confirm_forget_<memory_id>` / `cancel_forget_<memory_id>` — these bypass the `disambig:` parsing and go directly to `_process_forget_confirmation`.
 - `pending_action.set_pending_action` accepts `options: list[ResolvedEvent] | list[dict]` and an optional `extra` dict merged into the payload (used by memory_forget to park `memory_id`).
 - `EventResolver.resolve_from_context` only fires for vague titles ("it", "that", etc.) — checks `execution_result_json` of recent messages for `google_event_id`. `calendar_create` now stores `title/start/end/calendar_id` in its result data to enable this.
+- Agenda settings flow uses its own pending-action types (`agenda_settings`, `agenda_time_range`, `agenda_time_select`, `agenda_custom_text`) and interactive IDs `agenda_settings:{change_time,edit_text,remove_text}`, `agenda_range:<0-4>`, `agenda_time:<HH:MM>` — routed by `_process_agenda_settings_reply` BEFORE the `disambig:` parser. Plain-text inbound messages are intercepted at the top of `_process_text_message` via `_try_consume_agenda_custom_text` when pending is `agenda_custom_text`; that bypasses the planner entirely (cost tracker not incremented). Cancel keywords: `cancel`, `skip`, `nevermind`, `never mind`, `stop`.
 
 ## Memory System
 
@@ -60,7 +61,9 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 
 ## Daily Agenda Scheduler
 
-- Per-user prefs live at `user.preferences_json["daily_agenda"] = {enabled, timezone, time_local}`. Defaults from `Settings`: `Asia/Makassar` / `08:00`; tick 60s; send window 5 min. JSONB reassignment rule applies — use `daily_agenda.set_user_prefs`.
+- Per-user prefs live at `user.preferences_json["daily_agenda"] = {enabled, timezone, time_local, custom_footer_text?}`. Defaults from `Settings`: `Asia/Makassar` / `08:00`; tick 60s; send window 5 min. JSONB reassignment rule applies — use `daily_agenda.set_user_prefs` (or full-reassign the nested dict per the agenda-settings interactive handlers). `custom_footer_text` ≤ `AGENDA_CUSTOM_TEXT_MAX_LENGTH` (500) chars.
+- `format_agenda_message(events, local_date, timezone, custom_footer_text=None)` appends `\n\n---\n\n<custom>` after the events block (or after the "no events today" line). The separator is omitted when no custom text is set.
+- Users customize the agenda via the `daily_agenda_settings` planner tool (no args) → opens a 3-button menu (Change time / Edit text / Remove text). Time is chosen in two steps because WhatsApp lists max at 10 rows: `TIME_RANGES` (5 half-day buckets) → `generate_time_slots(range_index)` (10 or 8 half-hour slots). Helpers live in `app/services/daily_agenda.py`.
 - `DailyAgendaService.run_tick(now_utc)`: loads enabled users under a Postgres advisory lock (`pg_try_advisory_lock`), then per user computes due-window in their `ZoneInfo`, fetches Google Calendar events for `[day_start_local, day_end_local)`, sends WhatsApp, writes a `DailyAgendaSend(user_id, agenda_date)` row. Per-user failures are caught — one user must never break the batch.
 - Idempotency: `daily_agenda_sends` has `UNIQUE(user_id, agenda_date)`. The DB constraint — not the advisory lock — is the source of truth, so multi-replica and restarts are safe.
 - Revoked Google account (`TokenExpiredError`) or transient `GoogleAuthError` → skip the user silently for this tick, do not spam them.
