@@ -63,7 +63,7 @@ class Planner:
                     user_timezone=timezone.key,
                 ),
             },
-            *conversation_history[-20:],
+            *conversation_history[-10:],
             {"role": "user", "content": user_message},
         ]
 

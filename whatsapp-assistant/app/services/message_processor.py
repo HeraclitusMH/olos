@@ -417,7 +417,7 @@ async def _process_text_message(
     tool_executor: ToolExecutor,
 ) -> ToolExecutionLog:
     conversation_history = await build_conversation_context(
-        user.id, session, limit=20
+        user.id, session, limit=10
     )
     execution = ToolExecutionLog()
 

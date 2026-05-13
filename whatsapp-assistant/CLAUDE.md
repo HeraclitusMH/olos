@@ -100,10 +100,5 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 
 ## Current State
 
-- 306 unit tests pass with `python -m pytest -q`.
-- All planner tools implemented: `reply`, `ask_clarification`, `calendar_create`, `calendar_query`, `calendar_update`, `calendar_cancel`, `memory_store`, `memory_retrieve`, `memory_update`, `memory_forget`, `reminder_create`, `set_timezone`.
-- Daily-agenda scheduler runs in-process from the lifespan; sends are gated by the `daily_agenda_sends` unique constraint.
-- Interactive webhook replies (button_reply, list_reply) are parsed and routed through the disambiguation resume flow.
-- Google OAuth flow wired end-to-end (`/authorize` → consent → `/callback` → encrypted token storage).
 - `pgvector==0.2.5` pinned but `vector` extension not yet enabled — the first migration adding an embedding column must run `CREATE EXTENSION IF NOT EXISTS vector`.
 - The checked-in `.venv` launcher points at a missing Python path; run tests with system Python after installing `requirements.txt`.
