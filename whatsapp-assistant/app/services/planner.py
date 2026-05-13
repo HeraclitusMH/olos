@@ -127,7 +127,7 @@ class Planner:
     )
     async def _call_openai(self, messages: list[dict[str, str]]) -> Any:
         return await self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=messages,
             tools=TOOLS,
             tool_choice="required",

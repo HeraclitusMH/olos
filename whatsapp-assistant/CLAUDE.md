@@ -28,7 +28,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - DDL Alembic can't model (DESC/GIN indexes, triggers) goes through `op.execute(...)`.
 - Tokens never stored in plaintext or logged. Use `TokenEncryption` (`app/utils/encryption.py`). OAuth `state` uses Fernet with the same `ENCRYPTION_KEY` and a 10-minute TTL — do not replace with plain HMAC / unsigned JWT.
 - `ENCRYPTION_KEY` must be a Fernet key (`python -m app.utils.generate_key`).
-- Planner: `model="gpt-4o-mini"`, `tool_choice="required"`. System prompt injects current datetime per call via `zoneinfo.ZoneInfo` (not `pytz`). Plain text responses → fallback `reply` tool call.
+- Planner: `model="gpt-4.1-mini"`, `tool_choice="required"`. System prompt injects current datetime per call via `zoneinfo.ZoneInfo` (not `pytz`). Plain text responses → fallback `reply` tool call.
 - Daily OpenAI usage counted by request count (`daily_api_usage.usage_date` PK + `request_count`); over-limit reply: `Daily limit reached. Try again tomorrow!`
 - Tool execution goes through `ToolExecutor.execute()` returning `ToolResult(success, message, data)`. Calendar handlers persist `EventReference` and `Message.execution_result_json`.
 - Google Calendar uses raw httpx via `app/services/google_calendar.py` (NOT google-api-python-client). 401 → refresh once via `GoogleAuthService.refresh_token` and retry; second 401 → reply with authorize link. 429 → "Calendar is busy, try again in a moment."
