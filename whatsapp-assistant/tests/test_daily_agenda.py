@@ -182,11 +182,16 @@ class _FakeCalendar:
 
 
 class _FakeWhatsApp:
-    def __init__(self) -> None:
+    def __init__(self, *, text_raises: BaseException | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.text_calls: list[dict[str, str]] = []
         self.template_calls: list[dict[str, str]] = []
+        self._text_raises = text_raises
 
     async def send_text_message(self, to: str, text: str) -> dict[str, Any]:
+        self.text_calls.append({"to": to, "text": text})
+        if self._text_raises is not None:
+            raise self._text_raises
         self.sent.append((to, text))
         return {"ok": True}
 
@@ -199,7 +204,12 @@ class _FakeWhatsApp:
     ) -> dict[str, Any]:
         self.sent.append((to, body_text))
         self.template_calls.append(
-            {"to": to, "template_name": template_name, "language_code": language_code}
+            {
+                "to": to,
+                "template_name": template_name,
+                "language_code": language_code,
+                "body_text": body_text,
+            }
         )
         return {"ok": True}
 
@@ -513,12 +523,8 @@ async def test_run_tick_skips_user_with_no_google_account() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_tick_uses_template_message_with_configured_name() -> None:
-    """Agenda sends must use send_template_message, not send_text_message."""
-    import os
-
-    from app.config import get_settings
-
+async def test_run_tick_uses_text_message_by_default() -> None:
+    """Default send path is send_text_message — templates are fallback only."""
     user = _make_user()
     account = _make_account(user.id)
     load_session = _FakeSession(users=[user])
@@ -526,6 +532,42 @@ async def test_run_tick_uses_template_message_with_configured_name() -> None:
 
     calendar = _FakeCalendar(events=[])
     whatsapp = _FakeWhatsApp()
+    service = _build_service([load_session, process_session], calendar, whatsapp)
+
+    sent = await service.run_tick(now_utc=_due_now_utc())
+
+    assert sent == 1
+    assert len(whatsapp.text_calls) == 1
+    assert whatsapp.template_calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_tick_falls_back_to_template_outside_24h_window() -> None:
+    """If text send raises 131026, fall back to a flattened template send."""
+    import os
+
+    from app.config import get_settings
+    from app.services.whatsapp import WhatsAppAPIError
+
+    user = _make_user()
+    account = _make_account(user.id)
+    load_session = _FakeSession(users=[user])
+    process_session = _FakeSession(account=account, already_sent=False)
+
+    calendar = _FakeCalendar(
+        events=[
+            {
+                "summary": "Standup",
+                "start": {"dateTime": "2026-05-11T09:30:00+08:00"},
+                "end": {"dateTime": "2026-05-11T10:15:00+08:00"},
+            }
+        ]
+    )
+    whatsapp = _FakeWhatsApp(
+        text_raises=WhatsAppAPIError(
+            400, '{"error":{"code":131026,"message":"outside 24h"}}'
+        )
+    )
     service = _build_service([load_session, process_session], calendar, whatsapp)
 
     os.environ["WHATSAPP_TEMPLATE_NAME"] = "my_agenda_template"
@@ -540,8 +582,41 @@ async def test_run_tick_uses_template_message_with_configured_name() -> None:
         get_settings.cache_clear()
 
     assert sent == 1
+    assert len(whatsapp.text_calls) == 1
     assert len(whatsapp.template_calls) == 1
     call = whatsapp.template_calls[0]
     assert call["to"] == user.wa_id
     assert call["template_name"] == "my_agenda_template"
     assert call["language_code"] == "en_US"
+    # Template body must be a single line — no newlines allowed in params.
+    assert "\n" not in call["body_text"]
+    assert "Standup" in call["body_text"]
+
+
+@pytest.mark.asyncio
+async def test_run_tick_does_not_fall_back_on_non_24h_error() -> None:
+    """Errors other than 131026 must propagate and skip the user (no record)."""
+    from app.services.whatsapp import WhatsAppAPIError
+
+    user = _make_user()
+    account = _make_account(user.id)
+    load_session = _FakeSession(users=[user])
+    process_session = _FakeSession(account=account, already_sent=False)
+
+    calendar = _FakeCalendar(events=[])
+    whatsapp = _FakeWhatsApp(
+        text_raises=WhatsAppAPIError(
+            500, '{"error":{"code":131000,"message":"internal"}}'
+        )
+    )
+    service = _build_service([load_session, process_session], calendar, whatsapp)
+
+    sent = await service.run_tick(now_utc=_due_now_utc())
+
+    assert sent == 0
+    assert whatsapp.template_calls == []
+    from app.models import DailyAgendaSend
+
+    assert not any(
+        isinstance(obj, DailyAgendaSend) for obj in process_session.added
+    )

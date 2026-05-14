@@ -408,6 +408,17 @@ async def _finalize_failure(
 
 
 _AGENDA_CANCEL_KEYWORDS = {"cancel", "skip", "nevermind", "never mind", "stop"}
+_AGENDA_SETTINGS_TRIGGERS = {
+    "agenda settings",
+    "agenda setting",
+    "daily agenda settings",
+    "daily agenda setting",
+    "change agenda time",
+    "customize daily agenda",
+    "agenda options",
+    "agenda preferences",
+    "agenda menu",
+}
 
 
 async def _process_text_message(
@@ -426,6 +437,24 @@ async def _process_text_message(
     )
     if pending_text_log is not None:
         return pending_text_log
+
+    normalized_text = " ".join((inbound.text or "").lower().split()).strip(" .,!?")
+    logger.info(
+        "Text intercept check",
+        extra={"event": "agenda.intercept_check", "normalized": normalized_text},
+    )
+    if normalized_text in _AGENDA_SETTINGS_TRIGGERS:
+        logger.info(
+            "Bypassing planner for agenda settings trigger",
+            extra={"event": "agenda.intercept_hit"},
+        )
+        return await _execute_tool_calls(
+            [{"name": "daily_agenda_settings", "arguments": {}}],
+            user=user,
+            session=session,
+            inbound_message_id=inbound_message_id,
+            tool_executor=tool_executor,
+        )
 
     conversation_history = await build_conversation_context(
         user.id, session, limit=10

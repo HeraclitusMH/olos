@@ -42,7 +42,7 @@ from app.services.google_calendar import (
     GoogleCalendarError,
     GoogleCalendarService,
 )
-from app.services.whatsapp import WhatsAppClient
+from app.services.whatsapp import WhatsAppAPIError, WhatsAppClient
 from app.utils.exceptions import TokenExpiredError, WhatsAppSendError
 from app.utils.timezone import format_event_time, parse_iso_datetime
 
@@ -55,6 +55,9 @@ _ADVISORY_LOCK_KEY = 0x6461696C795F6167  # "daily_ag" — fits in int64.
 _PREFS_KEY = "daily_agenda"
 
 AGENDA_CUSTOM_TEXT_MAX_LENGTH = 500
+
+# Meta WhatsApp error code for "outside the 24-hour customer service window".
+_OUTSIDE_24H_ERROR_CODE = "131026"
 
 # Five contiguous ranges of half-hour slots covering the 24-hour day. Used by
 # the WhatsApp settings flow to pick a delivery time in two list-message steps
@@ -242,6 +245,59 @@ def format_agenda_message(
     return body
 
 
+def _is_outside_24h_window(exc: WhatsAppAPIError) -> bool:
+    body = getattr(exc, "body", "") or ""
+    return _OUTSIDE_24H_ERROR_CODE in body
+
+
+def _flatten_for_template(message: str) -> str:
+    """Collapse newlines/tabs so WhatsApp template body params are accepted.
+
+    Template body parameters reject newline/tab characters and runs of 4+
+    consecutive spaces (Meta error 132018). Free-form text messages have no
+    such restriction, so this is only applied when we fall back to a template.
+    """
+    flattened = message.replace("\t", " ")
+    flattened = flattened.replace("\r\n", "\n").replace("\r", "\n")
+    flattened = flattened.replace("\n", " | ")
+    while "    " in flattened:
+        flattened = flattened.replace("    ", "   ")
+    return flattened
+
+
+async def _send_agenda_message(
+    *,
+    whatsapp: WhatsAppClient,
+    to: str,
+    body: str,
+    template_name: str,
+    template_language: str,
+) -> None:
+    """Try send_text_message first; on 24h-window error fall back to template.
+
+    The agenda body is multi-line. ``send_text_message`` handles newlines
+    fine, but ``send_template_message`` does not — its body parameter must be
+    single-line — so the template fallback flattens the message first.
+    """
+    try:
+        await whatsapp.send_text_message(to=to, text=body)
+        return
+    except WhatsAppAPIError as exc:
+        if not _is_outside_24h_window(exc):
+            raise
+        logger.info(
+            "Daily agenda text send rejected as outside 24h window — using template",
+            extra={"event": "daily_agenda.fallback_template"},
+        )
+
+    await whatsapp.send_template_message(
+        to=to,
+        template_name=template_name,
+        body_text=_flatten_for_template(body),
+        language_code=template_language,
+    )
+
+
 # Type alias for clarity in dependency injection.
 SessionFactory = Callable[[], AsyncSession]
 
@@ -380,11 +436,12 @@ class DailyAgendaService:
             )
             settings = get_settings()
             try:
-                await self._whatsapp_client_factory().send_template_message(
+                await _send_agenda_message(
+                    whatsapp=self._whatsapp_client_factory(),
                     to=user.wa_id,
+                    body=message,
                     template_name=settings.whatsapp_template_name,
-                    body_text=message,
-                    language_code=settings.whatsapp_template_language,
+                    template_language=settings.whatsapp_template_language,
                 )
             except WhatsAppSendError:
                 logger.exception(
