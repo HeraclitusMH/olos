@@ -45,7 +45,7 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 ## Disambiguation & Pending Actions
 
 - When `calendar_update`/`calendar_cancel` match >1 event, `ToolExecutor._send_disambiguation` sends WhatsApp buttons/list and parks the original arguments + candidate events in `user.preferences_json["pending_action"]` (5-min TTL).
-- `InboundMessage.interactive_id` is set for button/list replies. `message_processor._process_interactive_reply` dispatches by `pending_action.type`: calendar actions resume via `execute_pending_action`; memory actions route to `_resume_memory_update` / `_resume_memory_forget_pick` / `_process_forget_confirmation`.
+- `InboundMessage.interactive_id` is set for button/list replies. `message_processor._process_interactive_reply` dispatches by `pending_action.type`: calendar actions resume via `execute_pending_action`; memory actions route to `_resume_memory_update` / `_resume_memory_forget_pick` / `_process_forget_confirmation`; reminder actions (`reminder_update`, `reminder_cancel`) route to `_resume_reminder_action`, which fetches the selected reminder by id and calls `ToolExecutor.execute` with `preselected_reminder=<row>`.
 - Option ids use format `disambig:<id>:<index>`. Decode with `disambiguation.parse_option_id`.
 - Memory forget confirmation uses button ids `confirm_forget_<memory_id>` / `cancel_forget_<memory_id>` — these bypass the `disambig:` parsing and go directly to `_process_forget_confirmation`.
 - `pending_action.set_pending_action` accepts `options: list[ResolvedEvent] | list[dict]` and an optional `extra` dict merged into the payload (used by memory_forget to park `memory_id`).
@@ -100,7 +100,10 @@ WhatsApp personal assistant backend. FastAPI + async SQLAlchemy + Postgres 16 (p
 - `ReminderScheduler.run_tick` loads up to 50 due unsent rows (`get_due_reminders`), sends each one, commits. Per-reminder errors are isolated. `reminder_scheduler_loop` ticks every `REMINDER_TICK_SECONDS` (default 15s).
 - Send strategy: try `WhatsAppClient.send_text_message` first; on `WhatsAppAPIError` whose body contains `131026` (outside 24h window) fall back to `send_template_message` with template `WHATSAPP_REMINDER_TEMPLATE_NAME` (default `reminder`, single `{{1}}` body param, language `WHATSAPP_TEMPLATE_LANGUAGE`).
 - After `REMINDER_MAX_ATTEMPTS` (default 3) failed sends the reminder is force-marked `sent=True` to avoid infinite retry. Non-24h send errors increment `failed_attempts` but do not retry within the same tick.
-- `reminder_create` planner tool: `(reminder_text, remind_at)`. The planner computes `remind_at` from injected current datetime + user timezone. Handler rejects naive datetimes, past times (30s grace), and times >365 days out via `ReminderError` (subclass of `AssistantError`).
+- Reminder planner tools: `reminder_create(reminder_text, remind_at)`, `reminder_query(search_text?, time_min?, time_max?)`, `reminder_update(search_text, new_reminder_text?, new_remind_at?)`, `reminder_cancel(search_text)`. The planner computes ISO datetimes from injected current datetime + user timezone.
+- `ReminderService` methods used by the executor: `create_reminder`, `search_unsent` (ILIKE on `reminder_text` + `remind_at` bounds, unsent only, cap 10), `get_by_id` (unsent by default), `update_reminder` (same naive/past/>365d validation as create), `delete_reminder` (hard-delete — reminders are ephemeral, no audit).
+- `reminder_update` / `reminder_cancel` reuse the disambiguation framework: >1 ILIKE match → WhatsApp buttons (≤3) or list (≤10), `pending_action.type` set accordingly, options serialized as `{reminder_id, reminder_text, remind_at}`. Resume goes through `ToolExecutor.execute(..., preselected_reminder=<Reminder>)` which short-circuits the search.
+- `ReminderError` (subclass of `AssistantError`) is raised for invalid `remind_at` / `new_remind_at` (naive, past beyond 30s grace, >365d out) and for `update_reminder` called with no changes.
 
 ## Current State
 

@@ -243,6 +243,110 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "reminder_query",
+            "description": (
+                "List the user's upcoming (unsent) reminders. Use when the "
+                "user asks what reminders they have, or to look up an "
+                "existing reminder before modifying or cancelling it. "
+                "Returns up to 10 unsent reminders ordered by scheduled time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_text": {
+                        "type": "string",
+                        "description": (
+                            "Optional case-insensitive substring filter on "
+                            "reminder text."
+                        ),
+                    },
+                    "time_min": {
+                        "type": "string",
+                        "description": (
+                            "Optional ISO 8601 datetime (with timezone). "
+                            "Only return reminders scheduled at or after this time."
+                        ),
+                    },
+                    "time_max": {
+                        "type": "string",
+                        "description": (
+                            "Optional ISO 8601 datetime (with timezone). "
+                            "Only return reminders scheduled at or before this time."
+                        ),
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reminder_update",
+            "description": (
+                "Find an existing unsent reminder by text and change its "
+                "scheduled time and/or body. Use this — NEVER reminder_create "
+                "— when the user says 'change', 'move', 'update' an existing "
+                "reminder. At least one of new_reminder_text or new_remind_at "
+                "must be provided."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_text": {
+                        "type": "string",
+                        "description": (
+                            "Keywords used to find the reminder to update. "
+                            "Matched case-insensitively against reminder text."
+                        ),
+                    },
+                    "new_reminder_text": {
+                        "type": "string",
+                        "description": "Optional replacement reminder body.",
+                    },
+                    "new_remind_at": {
+                        "type": "string",
+                        "description": (
+                            "Optional replacement scheduled time as an ISO 8601 "
+                            "datetime with timezone offset. Computed from current "
+                            "time + user request, in the user's timezone."
+                        ),
+                    },
+                },
+                "required": ["search_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reminder_cancel",
+            "description": (
+                "Find and cancel (delete) an existing unsent reminder. Use "
+                "when the user says 'cancel', 'delete', 'remove', 'nevermind' "
+                "about a reminder. NEVER use reminder_create for cancellations."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_text": {
+                        "type": "string",
+                        "description": (
+                            "Keywords used to find the reminder to cancel. "
+                            "Matched case-insensitively against reminder text."
+                        ),
+                    },
+                },
+                "required": ["search_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_timezone",
             "description": (
                 "Permanently update the user's timezone when they tell you "
@@ -356,6 +460,12 @@ Rules:
 7. Keep replies short and actionable. No fluff.
 8. Use reply tool for greetings, thank-yous, simple conversational responses.
 9. For reminders: when the user asks to be reminded at a specific time or after a delay, use the reminder_create tool. Compute the exact remind_at datetime from the current time above and the user's request, in the user's timezone. For relative times like "in 5 minutes", add exactly that duration to the current datetime. For "tomorrow at 9am", compute the next occurrence of 09:00 in the user's timezone. Always return remind_at as an ISO 8601 datetime with timezone offset.
-10. For timezone changes: when the user says where they are or that they have moved ("I'm in Bali", "I'm now in Tokyo", "moved back to Rome"), call set_timezone with the matching IANA zone (e.g. Bali -> Asia/Makassar, NYC -> America/New_York, Rome -> Europe/Rome). If the location is too ambiguous to map to one zone (e.g. just "the US"), use ask_clarification instead. Do not call set_timezone for transient phrases like "in a meeting" or "at the gym".
-11. OVERRIDE RULE — daily agenda settings: if the user's message contains 'agenda settings', 'agenda setting', 'daily agenda settings', 'change agenda time', 'customize daily agenda', or 'agenda options', you MUST call daily_agenda_settings with no arguments. This takes priority over memory_store, calendar_query, and every other tool. Do NOT interpret these phrases as facts to remember or as calendar queries. They are commands to open the settings menu for the automated morning WhatsApp summary."""
+10. Reminder updates and cancellations:
+    - Use reminder_update when the user wants to change the time or text of an existing reminder ("change", "move", "update", "reschedule", "make it earlier/later"). NEVER call reminder_create for these — that would create a duplicate.
+    - Use reminder_cancel when the user wants to delete or stop a reminder ("cancel", "delete", "remove", "scratch that", "nevermind about the reminder").
+    - Use reminder_query when the user asks what reminders they have, or when you need to look up an existing reminder before modifying it.
+    - Identify which reminder to update/cancel via search_text — short keywords from the original reminder (e.g. "invite Kale", "dentist"). If the user just refers to "the reminder" without specifics and only one is plausible, pass a broad search_text (e.g. "reminder") and the system will disambiguate.
+11. 12am / 12pm clarification: if the user says "12am" or "12pm" when scheduling or rescheduling a reminder or calendar event, call ask_clarification first: "Just to confirm — do you mean midnight (00:00, start of day) or noon (12:00, middle of day)?" Do not assume — these are commonly confused.
+12. For timezone changes: when the user says where they are or that they have moved ("I'm in Bali", "I'm now in Tokyo", "moved back to Rome"), call set_timezone with the matching IANA zone (e.g. Bali -> Asia/Makassar, NYC -> America/New_York, Rome -> Europe/Rome). If the location is too ambiguous to map to one zone (e.g. just "the US"), use ask_clarification instead. Do not call set_timezone for transient phrases like "in a meeting" or "at the gym".
+13. OVERRIDE RULE — daily agenda settings: if the user's message contains 'agenda settings', 'agenda setting', 'daily agenda settings', 'change agenda time', 'customize daily agenda', or 'agenda options', you MUST call daily_agenda_settings with no arguments. This takes priority over memory_store, calendar_query, and every other tool. Do NOT interpret these phrases as facts to remember or as calendar queries. They are commands to open the settings menu for the automated morning WhatsApp summary."""
 

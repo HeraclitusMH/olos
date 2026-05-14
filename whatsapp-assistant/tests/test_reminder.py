@@ -234,6 +234,91 @@ async def test_mark_sent_updates_flags() -> None:
     assert session.flushes == 1
 
 
+async def test_update_reminder_rejects_naive_new_remind_at() -> None:
+    user = _DummyUser()
+    reminder = _make_reminder(user=user)
+    session = _CapturingSession()
+    service = ReminderService()
+    naive = datetime.now() + timedelta(hours=1)  # noqa: DTZ005
+
+    with pytest.raises(ReminderError):
+        await service.update_reminder(
+            reminder,
+            new_text=None,
+            new_remind_at=naive,
+            db=session,  # type: ignore[arg-type]
+        )
+
+
+async def test_update_reminder_rejects_past_new_remind_at() -> None:
+    user = _DummyUser()
+    reminder = _make_reminder(user=user)
+    session = _CapturingSession()
+    service = ReminderService()
+    past = datetime.now(UTC) - timedelta(minutes=5)
+
+    with pytest.raises(ReminderError):
+        await service.update_reminder(
+            reminder,
+            new_text=None,
+            new_remind_at=past,
+            db=session,  # type: ignore[arg-type]
+        )
+
+
+async def test_update_reminder_applies_text_and_time_changes() -> None:
+    user = _DummyUser()
+    reminder = _make_reminder(user=user, text="old text")
+    session = _CapturingSession()
+    service = ReminderService()
+    new_time = datetime.now(UTC) + timedelta(hours=2)
+
+    updated = await service.update_reminder(
+        reminder,
+        new_text="new text",
+        new_remind_at=new_time,
+        db=session,  # type: ignore[arg-type]
+    )
+
+    assert updated is reminder
+    assert reminder.reminder_text == "new text"
+    assert reminder.remind_at == new_time
+    assert session.flushes == 1
+
+
+async def test_update_reminder_rejects_no_changes() -> None:
+    user = _DummyUser()
+    reminder = _make_reminder(user=user)
+    session = _CapturingSession()
+    service = ReminderService()
+
+    with pytest.raises(ReminderError):
+        await service.update_reminder(
+            reminder,
+            new_text=None,
+            new_remind_at=None,
+            db=session,  # type: ignore[arg-type]
+        )
+
+
+async def test_delete_reminder_calls_session_delete_and_flush() -> None:
+    user = _DummyUser()
+    reminder = _make_reminder(user=user)
+
+    deleted: list[Any] = []
+
+    class _DeletableSession(_CapturingSession):
+        async def delete(self, obj: Any) -> None:
+            deleted.append(obj)
+
+    session = _DeletableSession()
+    service = ReminderService()
+    await service.delete_reminder(reminder, session)  # type: ignore[arg-type]
+
+    assert deleted == [reminder]
+    assert session.flushes == 1
+
+
 async def test_increment_failed_attempts_increments_and_flushes() -> None:
     user = _DummyUser()
     reminder = _make_reminder(user=user, failed_attempts=1)

@@ -5,13 +5,15 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import EventReference, GoogleAccount, Memory, Message, User
+from app.models import EventReference, GoogleAccount, Memory, Message, Reminder, User
 from app.services.daily_agenda import (
     TIME_RANGES,
     generate_time_slots,
@@ -112,6 +114,7 @@ class ToolExecutor:
         db: AsyncSession,
         inbound_message_id: uuid.UUID | None = None,
         preselected_event: ResolvedEvent | None = None,
+        preselected_reminder: Reminder | None = None,
     ) -> ToolResult:
         handler = {
             "reply": self.handle_reply,
@@ -125,6 +128,9 @@ class ToolExecutor:
             "memory_update": self.handle_memory_update,
             "memory_forget": self.handle_memory_forget,
             "reminder_create": self.handle_reminder_create,
+            "reminder_query": self.handle_reminder_query,
+            "reminder_update": self.handle_reminder_update,
+            "reminder_cancel": self.handle_reminder_cancel,
             "set_timezone": self.handle_set_timezone,
             "daily_agenda_settings": self.handle_daily_agenda_settings,
         }.get(tool_name)
@@ -143,6 +149,7 @@ class ToolExecutor:
                 db=db,
                 inbound_message_id=inbound_message_id,
                 preselected_event=preselected_event,
+                preselected_reminder=preselected_reminder,
             )
         except AssistantError:
             # Surface domain errors (TokenExpiredError, GoogleCalendarError, …)
@@ -709,6 +716,335 @@ class ToolExecutor:
                 "tool": "reminder_create",
                 "reminder_id": str(reminder.id),
                 "remind_at": remind_at.isoformat(),
+            },
+        )
+
+    async def handle_reminder_query(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        **_: Any,
+    ) -> ToolResult:
+        user_tz = user.timezone or get_settings().default_timezone
+        time_min, time_max = None, None
+        for name in ("time_min", "time_max"):
+            raw = arguments.get(name)
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            parsed = _parse_with_user_tz(raw, user_tz)
+            if parsed is None:
+                return ToolResult(
+                    success=False,
+                    message="That date didn't look right — what range should I check?",
+                    data={"tool": "reminder_query", "reason": "invalid_datetime"},
+                )
+            if name == "time_min":
+                time_min = parsed
+            else:
+                time_max = parsed
+
+        raw_search = arguments.get("search_text")
+        search_text = raw_search.strip() if isinstance(raw_search, str) else None
+
+        service = self._reminder_service_factory()
+        reminders = await service.search_unsent(
+            user.id,
+            db,
+            search_text=search_text or None,
+            time_min=time_min,
+            time_max=time_max,
+            limit=10,
+        )
+        if not reminders:
+            return ToolResult(
+                success=True,
+                message="No upcoming reminders found.",
+                data={"tool": "reminder_query", "count": 0},
+            )
+
+        lines = ["Upcoming reminders:"]
+        for reminder in reminders:
+            when = _format_reminder_when(reminder.remind_at, user_tz)
+            text = _summarize(reminder.reminder_text, length=60)
+            lines.append(f"- {when} — {text}")
+        return ToolResult(
+            success=True,
+            message="\n".join(lines),
+            data={
+                "tool": "reminder_query",
+                "count": len(reminders),
+                "reminders": [
+                    {
+                        "id": str(r.id),
+                        "reminder_text": r.reminder_text,
+                        "remind_at": r.remind_at.isoformat(),
+                    }
+                    for r in reminders
+                ],
+            },
+        )
+
+    async def handle_reminder_update(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        preselected_reminder: Reminder | None = None,
+        **_: Any,
+    ) -> ToolResult:
+        new_reminder_text = arguments.get("new_reminder_text")
+        new_remind_at_raw = arguments.get("new_remind_at")
+
+        has_text = isinstance(new_reminder_text, str) and new_reminder_text.strip()
+        has_time = isinstance(new_remind_at_raw, str) and new_remind_at_raw.strip()
+        if not has_text and not has_time:
+            return ToolResult(
+                success=False,
+                message="What should I change about it?",
+                data={"tool": "reminder_update", "reason": "no_changes"},
+            )
+
+        user_tz = user.timezone or get_settings().default_timezone
+        new_remind_at: datetime | None = None
+        if has_time:
+            new_remind_at = _parse_with_user_tz(new_remind_at_raw, user_tz)
+            if new_remind_at is None:
+                return ToolResult(
+                    success=False,
+                    message="That time didn't look right — when should I move it to?",
+                    data={"tool": "reminder_update", "reason": "invalid_datetime"},
+                )
+
+        new_text = new_reminder_text.strip() if has_text else None
+
+        if preselected_reminder is not None:
+            return await self._apply_reminder_update(
+                reminder=preselected_reminder,
+                new_text=new_text,
+                new_remind_at=new_remind_at,
+                user=user,
+                db=db,
+            )
+
+        search_text = arguments.get("search_text")
+        if not isinstance(search_text, str) or not search_text.strip():
+            return ToolResult(
+                success=False,
+                message="Which reminder should I update?",
+                data={"tool": "reminder_update", "reason": "missing_search"},
+            )
+
+        service = self._reminder_service_factory()
+        matches = await service.search_unsent(
+            user.id, db, search_text=search_text.strip(), limit=10
+        )
+        if not matches:
+            return _reminder_not_found_result("reminder_update", search_text)
+        if len(matches) > 1:
+            return await self._send_reminder_disambiguation(
+                action_type="reminder_update",
+                action_label="update",
+                arguments=arguments,
+                user=user,
+                db=db,
+                reminders=matches,
+            )
+        return await self._apply_reminder_update(
+            reminder=matches[0],
+            new_text=new_text,
+            new_remind_at=new_remind_at,
+            user=user,
+            db=db,
+        )
+
+    async def handle_reminder_cancel(
+        self,
+        arguments: dict[str, Any],
+        *,
+        user: User,
+        db: AsyncSession,
+        preselected_reminder: Reminder | None = None,
+        **_: Any,
+    ) -> ToolResult:
+        if preselected_reminder is not None:
+            return await self._apply_reminder_cancel(
+                reminder=preselected_reminder, user=user, db=db
+            )
+
+        search_text = arguments.get("search_text")
+        if not isinstance(search_text, str) or not search_text.strip():
+            return ToolResult(
+                success=False,
+                message="Which reminder should I cancel?",
+                data={"tool": "reminder_cancel", "reason": "missing_search"},
+            )
+
+        service = self._reminder_service_factory()
+        matches = await service.search_unsent(
+            user.id, db, search_text=search_text.strip(), limit=10
+        )
+        if not matches:
+            return _reminder_not_found_result("reminder_cancel", search_text)
+        if len(matches) > 1:
+            return await self._send_reminder_disambiguation(
+                action_type="reminder_cancel",
+                action_label="cancel",
+                arguments=arguments,
+                user=user,
+                db=db,
+                reminders=matches,
+            )
+        return await self._apply_reminder_cancel(
+            reminder=matches[0], user=user, db=db
+        )
+
+    async def _apply_reminder_update(
+        self,
+        *,
+        reminder: Reminder,
+        new_text: str | None,
+        new_remind_at: datetime | None,
+        user: User,
+        db: AsyncSession,
+    ) -> ToolResult:
+        service = self._reminder_service_factory()
+        try:
+            await service.update_reminder(
+                reminder,
+                new_text=new_text,
+                new_remind_at=new_remind_at,
+                db=db,
+            )
+        except ReminderError as exc:
+            return ToolResult(
+                success=False,
+                message=exc.user_message,
+                data={"tool": "reminder_update", "reason": "rejected"},
+            )
+        user_tz = user.timezone or get_settings().default_timezone
+        when = _format_reminder_when(reminder.remind_at, user_tz)
+        text = _summarize(reminder.reminder_text, length=60)
+        return ToolResult(
+            success=True,
+            message=f"Updated reminder: {text} — {when}",
+            data={
+                "tool": "reminder_update",
+                "reminder_id": str(reminder.id),
+                "remind_at": reminder.remind_at.isoformat(),
+            },
+        )
+
+    async def _apply_reminder_cancel(
+        self,
+        *,
+        reminder: Reminder,
+        user: User,
+        db: AsyncSession,
+    ) -> ToolResult:
+        user_tz = user.timezone or get_settings().default_timezone
+        when = _format_reminder_when(reminder.remind_at, user_tz)
+        text = _summarize(reminder.reminder_text, length=60)
+        reminder_id = str(reminder.id)
+        service = self._reminder_service_factory()
+        await service.delete_reminder(reminder, db)
+        return ToolResult(
+            success=True,
+            message=f"Cancelled reminder: {text} — {when}",
+            data={
+                "tool": "reminder_cancel",
+                "reminder_id": reminder_id,
+            },
+        )
+
+    async def _send_reminder_disambiguation(
+        self,
+        *,
+        action_type: str,
+        action_label: str,
+        arguments: dict[str, Any],
+        user: User,
+        db: AsyncSession,
+        reminders: list[Reminder],
+    ) -> ToolResult:
+        user_tz = user.timezone or get_settings().default_timezone
+        disambiguation_id = uuid.uuid4().hex
+        body_text = f"Which reminder should I {action_label}?"
+        options_payload = [
+            {
+                "reminder_id": str(r.id),
+                "reminder_text": r.reminder_text,
+                "remind_at": r.remind_at.isoformat(),
+            }
+            for r in reminders
+        ]
+        client = self._whatsapp_client_factory()
+        try:
+            if len(reminders) <= 3:
+                buttons = [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": build_option_id(disambiguation_id, idx),
+                            "title": _truncate(
+                                _reminder_button_label(r, user_tz), 20
+                            ),
+                        },
+                    }
+                    for idx, r in enumerate(reminders)
+                ]
+                await client.send_interactive_buttons(
+                    to=user.wa_id, body_text=body_text, buttons=buttons
+                )
+            else:
+                rows = [
+                    {
+                        "id": build_option_id(disambiguation_id, idx),
+                        "title": _truncate(r.reminder_text, 24),
+                        "description": _truncate(
+                            _format_reminder_when(r.remind_at, user_tz), 72
+                        ),
+                    }
+                    for idx, r in enumerate(reminders)
+                ]
+                await client.send_interactive_list(
+                    to=user.wa_id,
+                    body_text=body_text,
+                    button_text="Pick reminder",
+                    sections=[{"title": "Reminders", "rows": rows}],
+                )
+        except Exception:
+            logger.exception(
+                "Failed to send reminder disambiguation for user=%s", user.id
+            )
+            return ToolResult(
+                success=False,
+                message=(
+                    "I found a few matching reminders. Try again with more detail."
+                ),
+                data={"tool": action_type, "reason": "disambiguation_send_failed"},
+            )
+
+        set_pending_action(
+            user,
+            disambiguation_id=disambiguation_id,
+            action_type=action_type,
+            arguments=arguments,
+            options=options_payload,
+        )
+        await db.flush()
+
+        return ToolResult(
+            success=True,
+            message="",
+            data={
+                "tool": action_type,
+                "reason": "disambiguation",
+                "disambiguation_id": disambiguation_id,
+                "options_count": len(reminders),
+                "sent_directly": True,
             },
         )
 
@@ -1477,6 +1813,59 @@ def _event_to_resolved(
         start=str(start),
         end=str(end),
         calendar_id=calendar_id,
+    )
+
+
+def _parse_with_user_tz(value: str, user_tz: str) -> datetime | None:
+    """Parse an ISO datetime, anchoring a naive result to ``user_tz``."""
+    try:
+        parsed = parse_iso_datetime(value)
+    except InvalidDateTimeError:
+        return None
+    if parsed.tzinfo is None:
+        try:
+            return parsed.replace(tzinfo=ZoneInfo(user_tz))
+        except ZoneInfoNotFoundError:
+            return parsed.replace(tzinfo=ZoneInfo(get_settings().default_timezone))
+    return parsed
+
+
+def _format_reminder_when(remind_at: datetime, timezone: str) -> str:
+    """Short user-facing label, e.g. ``Tue 13 May at 09:30`` in ``timezone``."""
+    iso = remind_at.isoformat()
+    try:
+        formatted = format_event_time(iso, iso, timezone)
+    except InvalidDateTimeError:
+        return iso
+    day_part, _, time_range = formatted.partition(",")
+    start_time = time_range.strip().split("-", 1)[0].strip()
+    if not start_time:
+        return day_part.strip() or iso
+    return f"{day_part.strip()} at {start_time}".strip()
+
+
+def _reminder_button_label(reminder: Reminder, timezone: str) -> str:
+    """Short button title combining time and reminder text (≤20 chars after truncate)."""
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        zone = None
+    if zone is not None:
+        local = reminder.remind_at.astimezone(zone)
+        prefix = f"{local.day} {local.strftime('%b')} {local.strftime('%H:%M')}"
+        return f"{prefix} {reminder.reminder_text}"
+    return reminder.reminder_text
+
+
+def _reminder_not_found_result(tool: str, search_text: Any) -> ToolResult:
+    if isinstance(search_text, str) and search_text.strip():
+        message = f"No matching reminder found for '{search_text.strip()}'."
+    else:
+        message = "No matching reminder found."
+    return ToolResult(
+        success=False,
+        message=message,
+        data={"tool": tool, "reason": "not_found"},
     )
 
 

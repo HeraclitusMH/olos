@@ -115,6 +115,113 @@ class ReminderService:
         )
         return list(result.scalars().all())
 
+    async def search_unsent(
+        self,
+        user_id: uuid.UUID,
+        db: AsyncSession,
+        *,
+        search_text: str | None = None,
+        time_min: datetime | None = None,
+        time_max: datetime | None = None,
+        limit: int = 10,
+    ) -> list[Reminder]:
+        """Return unsent reminders for a user, newest-due first.
+
+        ``search_text`` is matched against ``reminder_text`` with
+        case-insensitive ``ILIKE %text%`` semantics. ``time_min`` /
+        ``time_max`` bound ``remind_at`` inclusively.
+        """
+        stmt = select(Reminder).where(
+            Reminder.user_id == user_id, Reminder.sent.is_(False)
+        )
+        if isinstance(search_text, str) and search_text.strip():
+            stmt = stmt.where(
+                Reminder.reminder_text.ilike(f"%{search_text.strip()}%")
+            )
+        if time_min is not None:
+            stmt = stmt.where(Reminder.remind_at >= time_min)
+        if time_max is not None:
+            stmt = stmt.where(Reminder.remind_at <= time_max)
+        stmt = stmt.order_by(Reminder.remind_at.asc()).limit(limit)
+        result = await db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_by_id(
+        self,
+        reminder_id: uuid.UUID,
+        user_id: uuid.UUID,
+        db: AsyncSession,
+        *,
+        include_sent: bool = False,
+    ) -> Reminder | None:
+        stmt = select(Reminder).where(
+            Reminder.id == reminder_id, Reminder.user_id == user_id
+        )
+        if not include_sent:
+            stmt = stmt.where(Reminder.sent.is_(False))
+        result = await db.execute(stmt)
+        return result.scalars().first()
+
+    async def update_reminder(
+        self,
+        reminder: Reminder,
+        *,
+        new_text: str | None,
+        new_remind_at: datetime | None,
+        db: AsyncSession,
+    ) -> Reminder:
+        """Update text and/or scheduled time of an unsent reminder.
+
+        Same validation as ``create_reminder`` applies to
+        ``new_remind_at`` (naive rejected, past beyond grace rejected,
+        more than a year out rejected).
+        """
+        if new_text is None and new_remind_at is None:
+            raise ReminderError(log_message="update called with no changes")
+
+        if new_text is not None:
+            cleaned = new_text.strip()
+            if not cleaned:
+                raise ReminderError(log_message="new_text was empty")
+            reminder.reminder_text = cleaned
+
+        if new_remind_at is not None:
+            if new_remind_at.tzinfo is None:
+                raise ReminderError(
+                    log_message="new_remind_at must be timezone-aware",
+                    user_message="Reminder time needs a timezone.",
+                )
+            now_utc = datetime.now(UTC)
+            if new_remind_at < now_utc - _PAST_GRACE:
+                raise ReminderError(
+                    log_message=(
+                        f"new_remind_at {new_remind_at.isoformat()} is in the past"
+                    ),
+                    user_message=(
+                        "That time is in the past — when should I remind you?"
+                    ),
+                )
+            if new_remind_at > now_utc + _MAX_FUTURE:
+                raise ReminderError(
+                    log_message=(
+                        f"new_remind_at {new_remind_at.isoformat()} is over a year out"
+                    ),
+                    user_message=(
+                        "That's too far out — I can only remind up to a year ahead."
+                    ),
+                )
+            reminder.remind_at = new_remind_at
+
+        await db.flush()
+        return reminder
+
+    async def delete_reminder(
+        self, reminder: Reminder, db: AsyncSession
+    ) -> None:
+        """Hard-delete a reminder row. Reminders are ephemeral — no audit."""
+        await db.delete(reminder)
+        await db.flush()
+
     async def mark_sent(self, reminder: Reminder, db: AsyncSession) -> None:
         reminder.sent = True
         reminder.sent_at = datetime.now(UTC)

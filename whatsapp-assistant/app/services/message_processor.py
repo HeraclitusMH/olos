@@ -30,6 +30,7 @@ from app.services.pending_action import (
     set_pending_action,
 )
 from app.services.planner import Planner
+from app.services.reminder import ReminderService
 from app.services.tool_executor import (
     ToolExecutionLog,
     ToolExecutor,
@@ -488,9 +489,11 @@ async def _process_interactive_reply(
     inbound_message_id: Any,
     tool_executor: ToolExecutor,
     memory_service: MemoryService | None = None,
+    reminder_service: ReminderService | None = None,
 ) -> ToolExecutionLog:
     log = ToolExecutionLog()
     memory_service = memory_service or MemoryService()
+    reminder_service = reminder_service or ReminderService()
 
     if interactive_id.startswith("confirm_forget_") or interactive_id.startswith(
         "cancel_forget_"
@@ -593,6 +596,19 @@ async def _process_interactive_reply(
             session=session,
             tool_executor=tool_executor,
             memory_service=memory_service,
+        )
+
+    if action_type in {"reminder_update", "reminder_cancel"}:
+        return await _resume_reminder_action(
+            log=log,
+            action_type=action_type,
+            pending=pending,
+            option_payload=option_payload,
+            disambig_id=disambig_id,
+            user=user,
+            session=session,
+            tool_executor=tool_executor,
+            reminder_service=reminder_service,
         )
 
     clear_pending_action(user)
@@ -765,6 +781,73 @@ async def _resume_memory_forget_pick(
         }
     )
     if (confirmation.data or {}).get("sent_directly"):
+        log.sent_directly = True
+    return log
+
+
+async def _resume_reminder_action(
+    *,
+    log: ToolExecutionLog,
+    action_type: str,
+    pending: dict[str, Any],
+    option_payload: dict[str, Any],
+    disambig_id: str,
+    user: User,
+    session: AsyncSession,
+    tool_executor: ToolExecutor,
+    reminder_service: ReminderService,
+) -> ToolExecutionLog:
+    raw_id = option_payload.get("reminder_id")
+    reminder_uuid = _safe_uuid(raw_id)
+    if reminder_uuid is None:
+        clear_pending_action(user)
+        log.replies.append("That selection is no longer valid.")
+        log.results.append(
+            {
+                "tool": action_type,
+                "success": False,
+                "data": {"reason": "invalid_option"},
+            }
+        )
+        return log
+
+    reminder = await reminder_service.get_by_id(reminder_uuid, user.id, session)
+    if reminder is None:
+        clear_pending_action(user)
+        log.replies.append("That reminder is no longer available.")
+        log.results.append(
+            {
+                "tool": action_type,
+                "success": False,
+                "data": {"reason": "reminder_missing"},
+            }
+        )
+        return log
+
+    arguments = pending.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    clear_pending_action(user)
+    result = await tool_executor.execute(
+        action_type,
+        arguments,
+        user=user,
+        db=session,
+        preselected_reminder=reminder,
+    )
+    if result.message:
+        log.replies.append(result.message)
+    log.results.append(
+        {
+            "tool": action_type,
+            "success": result.success,
+            "data": result.data,
+            "disambiguation_id": disambig_id,
+            "selected_reminder_id": str(reminder.id),
+        }
+    )
+    if (result.data or {}).get("sent_directly"):
         log.sent_directly = True
     return log
 
