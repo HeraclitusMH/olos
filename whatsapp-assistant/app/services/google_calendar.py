@@ -132,6 +132,7 @@ class GoogleCalendarService:
         end: str,
         description: str | None = None,
         timezone: str = "Europe/Madrid",
+        recurrence: list[str] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "summary": title,
@@ -140,6 +141,9 @@ class GoogleCalendarService:
         }
         if description:
             body["description"] = description
+        if recurrence:
+            # List of RFC 5545 RRULE/RDATE strings, e.g. ["RRULE:FREQ=DAILY;COUNT=3"].
+            body["recurrence"] = recurrence
 
         response = await self._request_handling_rate_limit(
             "POST", self._events_url(), json=body

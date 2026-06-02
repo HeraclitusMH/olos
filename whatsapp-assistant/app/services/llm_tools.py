@@ -32,6 +32,73 @@ TOOLS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Optional event notes or context.",
                     },
+                    "recurrence": {
+                        "type": "object",
+                        "description": (
+                            "Optional repeat rule. Set ONLY when the user wants "
+                            "a repeating event (e.g. 'every day for 3 days', "
+                            "'yoga every Monday', 'weekly until June'). Omit "
+                            "entirely for one-off events. When set, 'start' and "
+                            "'end' MUST be the FIRST occurrence; the recurrence "
+                            "generates the rest — do NOT also create duplicate "
+                            "events."
+                        ),
+                        "properties": {
+                            "frequency": {
+                                "type": "string",
+                                "description": "How often it repeats.",
+                                "enum": ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"],
+                            },
+                            "interval": {
+                                "type": "integer",
+                                "description": (
+                                    "Repeat every N units of frequency "
+                                    "(default 1). E.g. 2 with WEEKLY = every "
+                                    "other week."
+                                ),
+                                "minimum": 1,
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": (
+                                    "Total number of occurrences. Use for "
+                                    "'for 3 days', '5 times'. Mutually "
+                                    "exclusive with 'until'."
+                                ),
+                                "minimum": 1,
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": (
+                                    "ISO 8601 date or datetime for the last "
+                                    "occurrence (inclusive). Use for 'until "
+                                    "June 5'. Mutually exclusive with 'count'."
+                                ),
+                            },
+                            "by_day": {
+                                "type": "array",
+                                "description": (
+                                    "Weekdays the event falls on, for WEEKLY "
+                                    "rules. Two-letter codes."
+                                ),
+                                "items": {
+                                    "type": "string",
+                                    "description": "Weekday code.",
+                                    "enum": [
+                                        "MO",
+                                        "TU",
+                                        "WE",
+                                        "TH",
+                                        "FR",
+                                        "SA",
+                                        "SU",
+                                    ],
+                                },
+                            },
+                        },
+                        "required": ["frequency"],
+                        "additionalProperties": False,
+                    },
                 },
                 "required": ["title", "start", "end"],
                 "additionalProperties": False,
@@ -454,6 +521,7 @@ Rules:
 1. ALWAYS use a tool call. Never respond with plain text without calling a tool.
 2. For calendar operations: interpret relative dates ("tomorrow", "next Monday") relative to current date/time and user timezone.
 3. If user does not specify end time, default to 1 hour after start.
+3a. Recurring/repeating events: when the user wants an event that repeats ("every day for 3 days", "yoga every Monday", "standup daily until Friday", "weekly for a month"), call calendar_create ONCE with the recurrence parameter. Set start/end to the FIRST occurrence and describe the repeat in recurrence (frequency + count or until + by_day). NEVER emit multiple calendar_create calls for a single repeating series.
 4. If request is ambiguous or missing critical info, use ask_clarification.
 5. For memory: store facts concisely but completely. Generate 2-5 relevant tags.
 6. When user references previous message ("move IT", "cancel THAT"), use conversation context.

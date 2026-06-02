@@ -101,6 +101,7 @@ class _FakeCalendar:
         end: str,
         description: str | None = None,
         timezone: str = "Europe/Madrid",
+        recurrence: list[str] | None = None,
     ) -> dict[str, Any]:
         self.create_calls.append(
             {
@@ -109,6 +110,7 @@ class _FakeCalendar:
                 "end": end,
                 "description": description,
                 "timezone": timezone,
+                "recurrence": recurrence,
             }
         )
         if self._create_raises:
@@ -273,6 +275,83 @@ async def test_calendar_create_401_triggers_refresh_and_retry() -> None:
     assert result.success is True
     assert auth.refresh_calls == 1
     assert len(calendar.create_calls) == 2
+
+
+async def test_calendar_create_daily_recurrence_builds_rrule() -> None:
+    user = _DummyUser()
+    session = _FakeSession(_make_account(user.id))
+    calendar = _FakeCalendar(create_returns={"id": "evt-rec"})
+    executor, _ = _build_executor(token="ya29.fresh", calendar=calendar)
+
+    result = await executor.execute(
+        "calendar_create",
+        {
+            "title": "Yoga",
+            "start": "2026-06-03T07:00:00+02:00",
+            "end": "2026-06-03T08:00:00+02:00",
+            "recurrence": {"frequency": "DAILY", "count": 3},
+        },
+        user=user,  # type: ignore[arg-type]
+        db=session,  # type: ignore[arg-type]
+    )
+
+    assert result.success is True
+    # A single event is created — the RRULE generates the rest server-side.
+    assert len(calendar.create_calls) == 1
+    assert calendar.create_calls[0]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=3"]
+    assert result.data["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=3"]
+    assert "daily ×3" in result.message
+
+
+async def test_calendar_create_weekly_byday_recurrence() -> None:
+    user = _DummyUser()
+    session = _FakeSession(_make_account(user.id))
+    calendar = _FakeCalendar(create_returns={"id": "evt-rec"})
+    executor, _ = _build_executor(token="ya29.fresh", calendar=calendar)
+
+    result = await executor.execute(
+        "calendar_create",
+        {
+            "title": "Standup",
+            "start": "2026-06-01T09:00:00+02:00",
+            "end": "2026-06-01T09:15:00+02:00",
+            "recurrence": {
+                "frequency": "WEEKLY",
+                "by_day": ["MO", "WE", "FR"],
+                "until": "2026-06-30",
+            },
+        },
+        user=user,  # type: ignore[arg-type]
+        db=session,  # type: ignore[arg-type]
+    )
+
+    assert result.success is True
+    rule = calendar.create_calls[0]["recurrence"][0]
+    assert rule == "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20260630T215959Z"
+
+
+async def test_calendar_create_invalid_recurrence_returns_friendly_error() -> None:
+    user = _DummyUser()
+    session = _FakeSession(_make_account(user.id))
+    calendar = _FakeCalendar(create_returns={"id": "evt"})
+    executor, _ = _build_executor(token="ya29.fresh", calendar=calendar)
+
+    result = await executor.execute(
+        "calendar_create",
+        {
+            "title": "Yoga",
+            "start": "2026-06-03T07:00:00+02:00",
+            "end": "2026-06-03T08:00:00+02:00",
+            "recurrence": {"frequency": "HOURLY"},
+        },
+        user=user,  # type: ignore[arg-type]
+        db=session,  # type: ignore[arg-type]
+    )
+
+    assert result.success is False
+    assert result.data["reason"] == "invalid_recurrence"
+    # Nothing was created on the calendar.
+    assert calendar.create_calls == []
 
 
 # --- calendar_query --------------------------------------------------------

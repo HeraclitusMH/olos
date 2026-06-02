@@ -39,6 +39,11 @@ from app.services.pending_action import (
 from app.services.reminder import ReminderError, ReminderService
 from app.services.whatsapp import WhatsAppClient
 from app.utils.exceptions import AssistantError
+from app.utils.recurrence import (
+    RecurrenceError,
+    build_recurrence_rule,
+    describe_recurrence,
+)
 from app.utils.search import generate_tags
 from app.utils.timezone import (
     InvalidDateTimeError,
@@ -196,6 +201,7 @@ class ToolExecutor:
         start = arguments.get("start")
         end = arguments.get("end")
         description = arguments.get("description")
+        recurrence_args = arguments.get("recurrence")
 
         if not title or not start or not end:
             return ToolResult(
@@ -214,11 +220,39 @@ class ToolExecutor:
                 data={"tool": "calendar_create", "reason": "invalid_datetime"},
             )
 
+        timezone = user.timezone or get_settings().default_timezone
+
+        recurrence: list[str] | None = None
+        if recurrence_args:
+            try:
+                recurrence = [
+                    build_recurrence_rule(recurrence_args, timezone=timezone)
+                ]
+            except RecurrenceError as exc:
+                logger.info(
+                    "calendar_create rejected invalid recurrence",
+                    extra={
+                        "event": "calendar.invalid_recurrence",
+                        "reason": str(exc),
+                    },
+                )
+                return ToolResult(
+                    success=False,
+                    message=(
+                        "I couldn't set up that repeat schedule — try "
+                        "something like 'every day for 3 days' or "
+                        "'every Monday until June'."
+                    ),
+                    data={
+                        "tool": "calendar_create",
+                        "reason": "invalid_recurrence",
+                    },
+                )
+
         token, account = await self._get_token_and_account(user, db)
         if token is None or account is None:
             return self._unauthorized_result("calendar_create", user)
 
-        timezone = user.timezone or get_settings().default_timezone
         event = await self._call_with_refresh(
             user=user,
             db=db,
@@ -232,6 +266,7 @@ class ToolExecutor:
                 end=end,
                 description=description if isinstance(description, str) else None,
                 timezone=timezone,
+                recurrence=recurrence,
             ),
         )
 
@@ -251,9 +286,12 @@ class ToolExecutor:
             await db.flush()
 
         formatted = format_event_time(start, end, timezone)
+        message = f"Created: {title} - {formatted}"
+        if recurrence:
+            message += f" ({describe_recurrence(recurrence_args)})"
         return ToolResult(
             success=True,
-            message=f"Created: {title} - {formatted}",
+            message=message,
             data={
                 "tool": "calendar_create",
                 "google_event_id": google_event_id,
@@ -262,6 +300,7 @@ class ToolExecutor:
                 "start": start,
                 "end": end,
                 "calendar_id": account.calendar_id,
+                "recurrence": recurrence,
             },
         )
 
